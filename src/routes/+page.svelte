@@ -24,6 +24,11 @@
     | { kind: "error"; message: string };
 
   const PREVIEW_CHARS = 120;
+  const AUTO_COPY_KEY = "transcript.autoCopy";
+
+  function formatSegments(tx: TranscriptResult): string {
+    return tx.segments.map((s) => s.text).join(" ").trim() || tx.text;
+  }
 
   let models = $state<ModelEntry[]>([]);
   let selectedModel = $state<ModelId>("large-v3-turbo");
@@ -38,6 +43,7 @@
   let segmentsContainer: HTMLDivElement | null = $state(null);
   let dragging = $state<boolean>(false);
   let copied = $state<boolean>(false);
+  let autoCopy = $state<boolean>(true);
   let history = $state<TranscriptSummary[]>([]);
   let currentId = $state<string | null>(null);
   let query = $state<string>("");
@@ -55,11 +61,7 @@
       status.kind === "downloading",
   );
   const segments = $derived(transcript?.segments ?? []);
-  const joinedText = $derived(
-    transcript
-      ? segments.map((s) => s.text).join(" ").trim() || transcript.text
-      : "",
-  );
+  const joinedText = $derived(transcript ? formatSegments(transcript) : "");
   const activeSegmentIdx = $derived.by(() => {
     if (!audioUrl || segments.length === 0) return -1;
     const t = currentTime;
@@ -91,6 +93,9 @@
   let pendingListeners: Promise<UnlistenFn>[] = [];
 
   onMount(() => {
+    try {
+      autoCopy = localStorage.getItem(AUTO_COPY_KEY) !== "false";
+    } catch {}
     (async () => {
       const [m, h] = await Promise.all([
         api.listModels(),
@@ -158,6 +163,7 @@
     try {
       const result = await call();
       transcript = result;
+      if (autoCopy) void copyToClipboard(formatSegments(result));
       const duration = result.segments.at(-1)?.end ?? null;
       const saved = await api.saveTranscript(selectedModel, source, duration, result);
       currentId = saved.id;
@@ -227,10 +233,15 @@
     );
   }
 
-  async function copyToClipboard() {
-    await navigator.clipboard.writeText(joinedText);
-    copied = true;
-    setTimeout(() => (copied = false), 1400);
+  async function copyToClipboard(text: string) {
+    if (!text) return;
+    try {
+      await navigator.clipboard.writeText(text);
+      copied = true;
+      setTimeout(() => (copied = false), 1400);
+    } catch {
+      // Clipboard can reject when the webview lacks focus; fail silently.
+    }
   }
 
   async function saveTranscriptToFile() {
@@ -263,6 +274,12 @@
   function onTimeUpdate(e: Event) {
     currentTime = (e.currentTarget as HTMLAudioElement).currentTime;
   }
+
+  $effect(() => {
+    try {
+      localStorage.setItem(AUTO_COPY_KEY, String(autoCopy));
+    } catch {}
+  });
 
   $effect(() => {
     if (activeSegmentIdx < 0 || !segmentsContainer) return;
@@ -397,16 +414,37 @@
       <img class="brand-mark" src="/icon.svg" alt="" width="22" height="22" />
       <span>Transcript</span>
     </div>
-    <div class="model-pill" class:warn={needsDownload}>
-      <label for="model" class="sr-only">Model</label>
-      <select id="model" bind:value={selectedModel} disabled={busy}>
-        {#each models as m}
-          <option value={m.id}>{m.display}</option>
-        {/each}
-      </select>
-      {#if needsDownload && status.kind !== "downloading"}
-        <button class="pill-action" onclick={downloadSelected}>Download</button>
-      {/if}
+    <div class="top-right">
+      <button
+        class="icon-btn auto-copy-toggle"
+        class:on={autoCopy}
+        onclick={() => (autoCopy = !autoCopy)}
+        aria-pressed={autoCopy}
+        title={autoCopy ? "Auto-copy on · click to disable" : "Auto-copy off · click to enable"}
+      >
+        {#if autoCopy}
+          <svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true">
+            <rect x="4" y="4" width="12" height="12" rx="2" stroke="currentColor" stroke-width="1.7" fill="none"/>
+            <rect x="8" y="8" width="12" height="12" rx="2" fill="currentColor"/>
+          </svg>
+        {:else}
+          <svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true">
+            <rect x="4" y="4" width="12" height="12" rx="2" stroke="currentColor" stroke-width="1.7" fill="none"/>
+            <rect x="8" y="8" width="12" height="12" rx="2" stroke="currentColor" stroke-width="1.7" fill="none"/>
+          </svg>
+        {/if}
+      </button>
+      <div class="model-pill" class:warn={needsDownload}>
+        <label for="model" class="sr-only">Model</label>
+        <select id="model" bind:value={selectedModel} disabled={busy}>
+          {#each models as m}
+            <option value={m.id}>{m.display}</option>
+          {/each}
+        </select>
+        {#if needsDownload && status.kind !== "downloading"}
+          <button class="pill-action" onclick={downloadSelected}>Download</button>
+        {/if}
+      </div>
     </div>
   </header>
 
@@ -453,7 +491,7 @@
             <svg viewBox="0 0 24 24" width="16" height="16"><path d="M14 6l-6 6 6 6" stroke="currentColor" stroke-width="1.8" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>
           </button>
         {/if}
-        <button class="icon-btn push-right" onclick={copyToClipboard} title="Copy">
+        <button class="icon-btn push-right" onclick={() => copyToClipboard(joinedText)} title="Copy">
           {#if copied}
             <svg viewBox="0 0 24 24" width="16" height="16"><path d="M5 12.5l4 4 10-10" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>
           {:else}
@@ -766,6 +804,12 @@
     transition: background 0.12s ease, color 0.12s ease;
   }
   .icon-btn:hover { background: var(--accent-soft); color: var(--accent); }
+  .icon-btn.on { background: var(--accent-soft); color: var(--accent); }
+  .top-right {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+  }
 
   .player {
     display: block;
