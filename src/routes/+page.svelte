@@ -318,7 +318,10 @@
 
 <main class:has-transcript={!!transcript}>
   <header class="top">
-    <div class="brand">Transcript</div>
+    <div class="brand">
+      <img class="brand-mark" src="/icon.svg" alt="" width="22" height="22" />
+      <span>Transcript</span>
+    </div>
     <div class="model-pill" class:warn={needsDownload}>
       <label for="model" class="sr-only">Model</label>
       <select id="model" bind:value={selectedModel} disabled={busy}>
@@ -481,10 +484,18 @@
     gap: 12px;
   }
   .brand {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
     font-size: 15px;
     font-weight: 600;
     letter-spacing: -0.01em;
     color: var(--text);
+  }
+  .brand-mark {
+    display: block;
+    border-radius: 5px;
+    box-shadow: 0 1px 2px rgba(0, 0, 0, 0.08);
   }
   .model-pill {
     display: inline-flex;

@@ -14,3 +14,7 @@ vite.config.ts.timestamp-*
 
 # Sample audio used for smoke-testing
 jfk.wav
+
+# `tauri icon` also emits iOS/Android sizes; we ship macOS only.
+/src-tauri/icons/android/
+/src-tauri/icons/ios/
