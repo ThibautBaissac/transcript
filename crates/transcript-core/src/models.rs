@@ -205,14 +205,32 @@ async fn download_to_file<F>(url: &str, dest: &Path, mut progress_cb: F) -> Resu
 where
     F: FnMut(u64, Option<u64>),
 {
+    let tmp = dest.with_extension("partial");
+    // Wrap the body so any early-exit path (HTTP error, IO error, killed mid-stream)
+    // removes the orphan .partial instead of letting it accumulate across retries.
+    let result = download_to_file_inner(url, &tmp, &mut progress_cb).await;
+    if result.is_err() {
+        let _ = tokio::fs::remove_file(&tmp).await;
+        return result;
+    }
+    if let Err(e) = tokio::fs::rename(&tmp, dest).await {
+        let _ = tokio::fs::remove_file(&tmp).await;
+        return Err(e).with_context(|| format!("renaming {} -> {}", tmp.display(), dest.display()));
+    }
+    Ok(())
+}
+
+async fn download_to_file_inner<F>(url: &str, tmp: &Path, progress_cb: &mut F) -> Result<()>
+where
+    F: FnMut(u64, Option<u64>),
+{
     let resp = reqwest::get(url)
         .await
         .with_context(|| format!("GET {}", url))?
         .error_for_status()
         .with_context(|| format!("HTTP error for {}", url))?;
     let total = resp.content_length();
-    let tmp = dest.with_extension("partial");
-    let mut file = tokio::fs::File::create(&tmp).await?;
+    let mut file = tokio::fs::File::create(tmp).await?;
     let mut downloaded: u64 = 0;
     let mut stream = resp.bytes_stream();
     while let Some(chunk) = stream.next().await {
@@ -223,8 +241,6 @@ where
     }
     file.flush().await?;
     file.sync_all().await?;
-    drop(file);
-    tokio::fs::rename(&tmp, dest).await?;
     Ok(())
 }
 

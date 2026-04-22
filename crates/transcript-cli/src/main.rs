@@ -48,7 +48,7 @@ struct Args {
     #[arg(long, requires = "record")]
     no_cue: bool,
 
-    /// Model to use. Defaults to large-v3-turbo.
+    /// Model to use. One of: base.en, small.en, medium.en, large-v3, large-v3-turbo.
     #[arg(short, long, default_value = "large-v3-turbo")]
     model: String,
 

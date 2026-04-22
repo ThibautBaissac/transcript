@@ -203,9 +203,17 @@ pub fn format_srt(result: &TranscriptResult) -> String {
     out
 }
 
-/// Format a result as JSON.
+/// Format a result as JSON. Returns an empty string (and logs to stderr) if serialization
+/// fails, so the CLI's "stdout = transcript or nothing" contract is preserved rather than
+/// emitting misleading `{}`.
 pub fn format_json(result: &TranscriptResult) -> String {
-    serde_json::to_string_pretty(result).unwrap_or_else(|_| "{}".into())
+    match serde_json::to_string_pretty(result) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("warning: failed to serialize transcript as JSON: {}", e);
+            String::new()
+        }
+    }
 }
 
 fn fmt_ts(seconds: f32) -> String {

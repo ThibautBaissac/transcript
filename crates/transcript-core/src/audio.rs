@@ -315,6 +315,19 @@ pub fn record_until_silence(
     silence_threshold: f32,
     mut on_event: impl FnMut(RecordEvent),
 ) -> Result<RecordedAudio> {
+    anyhow::ensure!(
+        silence_threshold.is_finite() && (0.0..=1.0).contains(&silence_threshold),
+        "silence_threshold must be a finite value in [0.0, 1.0], got {}",
+        silence_threshold
+    );
+    anyhow::ensure!(
+        !max_duration.is_zero(),
+        "max_duration must be greater than zero"
+    );
+    anyhow::ensure!(
+        !silence_duration.is_zero(),
+        "silence_duration must be greater than zero"
+    );
     let handle = start_capture(|_| {})?;
     let sample_rate = handle.sample_rate;
     let channels = handle.channels as usize;
@@ -405,5 +418,46 @@ mod tests {
     fn decode_file_errors_on_missing() {
         let r = decode_file("/definitely/does/not/exist.wav");
         assert!(r.is_err());
+    }
+
+    #[test]
+    fn record_until_silence_rejects_invalid_threshold() {
+        for bad in [-0.1_f32, 1.1, f32::NAN, f32::INFINITY] {
+            let r = record_until_silence(
+                std::time::Duration::from_millis(10),
+                std::time::Duration::from_millis(5),
+                bad,
+                |_| {},
+            );
+            assert!(r.is_err(), "expected rejection for threshold {}", bad);
+        }
+    }
+
+    // Requires a default input device; skipped gracefully when cpal can't open one
+    // (headless CI, sandboxed runners). When it does run, it exercises the thread-
+    // spawning + stop + join path that `CaptureHandle` owns.
+    #[test]
+    fn capture_handle_start_and_stop_roundtrip() {
+        let handle = match start_capture(|_| {}) {
+            Ok(h) => h,
+            Err(_) => return, // no input device in this environment
+        };
+        assert!(handle.sample_rate > 0);
+        assert!(handle.channels >= 1);
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        // stop_and_take must join the audio thread (otherwise the Vec could race) and
+        // return ownership of whatever samples accumulated.
+        let _samples = handle.stop_and_take();
+    }
+
+    #[test]
+    fn capture_handle_drop_without_take_does_not_hang() {
+        let handle = match start_capture(|_| {}) {
+            Ok(h) => h,
+            Err(_) => return,
+        };
+        // Dropping the handle should signal the owner thread to exit and join it.
+        // If this test ever hangs, the Drop impl is broken.
+        drop(handle);
     }
 }
