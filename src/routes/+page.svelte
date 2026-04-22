@@ -3,6 +3,7 @@
   import { save } from "@tauri-apps/plugin-dialog";
   import { writeTextFile } from "@tauri-apps/plugin-fs";
   import type { UnlistenFn } from "@tauri-apps/api/event";
+  import { getCurrentWebview } from "@tauri-apps/api/webview";
   import {
     api,
     events,
@@ -24,6 +25,8 @@
   let level = $state<number>(0);
   let transcript = $state<TranscriptResult | null>(null);
   let transcriptText = $state<string>("");
+  let droppedFile = $state<string | null>(null);
+  let dragging = $state<boolean>(false);
   let vuCanvas: HTMLCanvasElement | undefined = $state();
 
   const selectedEntry = $derived(
@@ -57,7 +60,26 @@
       const pct = p.total ? Math.round((p.downloaded / p.total) * 100) : 0;
       status = { kind: "downloading", model: p.model, pct, stage: p.stage };
     });
-    pendingListeners = [lvl, dl];
+    // Tauri-level drag-drop: gives us real filesystem paths (HTML5 DnD in a webview
+    // only exposes file names). We listen on the webview, not the DOM.
+    const drop = getCurrentWebview().onDragDropEvent((event) => {
+      const e = event.payload;
+      if (e.type === "enter" || e.type === "over") {
+        if (!busy) dragging = true;
+      } else if (e.type === "leave") {
+        dragging = false;
+      } else if (e.type === "drop") {
+        dragging = false;
+        const first = e.paths?.[0];
+        if (!first) return;
+        if (busy) {
+          status = { kind: "error", message: "Busy — finish the current operation first." };
+          return;
+        }
+        transcribeDroppedFile(first);
+      }
+    });
+    pendingListeners = [lvl, dl, drop];
 
     // rAF-driven canvas redraw: decouples drawing from IPC frequency, and naturally
     // caps at display refresh rate regardless of how fast level events arrive.
@@ -97,11 +119,27 @@
     models = await api.listModels();
   }
 
-  async function downloadSelected() {
-    status = { kind: "downloading", model: selectedModel, pct: 0, stage: "ggml" };
+  async function ensureModel(id: string) {
+    status = { kind: "downloading", model: id, pct: 0, stage: "ggml" };
+    await api.downloadModel(id);
+    await refreshModels();
+  }
+
+  async function runTranscribe(call: () => Promise<TranscriptResult>) {
+    status = { kind: "transcribing" };
     try {
-      await api.downloadModel(selectedModel);
-      await refreshModels();
+      const result = await call();
+      transcript = result;
+      transcriptText = result.text;
+      status = { kind: "idle" };
+    } catch (e) {
+      status = { kind: "error", message: String(e) };
+    }
+  }
+
+  async function downloadSelected() {
+    try {
+      await ensureModel(selectedModel);
       status = { kind: "idle" };
     } catch (e) {
       status = { kind: "error", message: String(e) };
@@ -123,22 +161,34 @@
     }
   }
 
+  async function transcribeDroppedFile(path: string) {
+    if (busy) return;
+    droppedFile = path;
+    try {
+      // Auto-fetch the model on drop — a drop is an explicit transcribe intent,
+      // so block on download rather than forcing the user to notice a disabled button.
+      if (needsDownload) await ensureModel(selectedModel);
+    } catch (e) {
+      status = { kind: "error", message: String(e) };
+      return;
+    }
+    await runTranscribe(() => api.transcribeFile(path, selectedModel));
+  }
+
   async function stopAndTranscribe() {
     if (status.kind !== "recording") return;
     if (timerId) {
       clearInterval(timerId);
       timerId = undefined;
     }
+    droppedFile = null;
     try {
       await api.stopRecording();
-      status = { kind: "transcribing" };
-      const result = await api.transcribeCurrent(selectedModel);
-      transcript = result;
-      transcriptText = result.text;
-      status = { kind: "idle" };
     } catch (e) {
       status = { kind: "error", message: String(e) };
+      return;
     }
+    await runTranscribe(() => api.transcribeCurrent(selectedModel));
   }
 
   async function copyToClipboard() {
@@ -152,6 +202,11 @@
     });
     if (!path) return;
     await writeTextFile(path, transcriptText);
+  }
+
+  function basename(path: string): string {
+    const i = Math.max(path.lastIndexOf("/"), path.lastIndexOf("\\"));
+    return i >= 0 ? path.slice(i + 1) : path;
   }
 
   function fmtDuration(seconds: number): string {
@@ -216,10 +271,24 @@
       <span class="elapsed">{fmtDuration(elapsed)}</span>
     </div>
 
+    <p class="hint">
+      {#if status.kind === "transcribing" && droppedFile}
+        Transcribing <code>{basename(droppedFile)}</code>…
+      {:else}
+        or drop an audio file anywhere in the window
+      {/if}
+    </p>
+
     {#if status.kind === "error"}
       <div class="error">{status.message}</div>
     {/if}
   </section>
+
+  {#if dragging}
+    <div class="drop-overlay" aria-hidden="true">
+      <div class="drop-card">Drop audio to transcribe</div>
+    </div>
+  {/if}
 
   <section class="transcript-panel">
     <div class="panel-header">
@@ -346,9 +415,42 @@
     color: #333;
     min-width: 52px;
   }
+  .hint {
+    margin: 0;
+    color: #777;
+    font-size: 13px;
+  }
+  .hint code {
+    font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+    font-size: 12px;
+    background: rgba(0, 0, 0, 0.05);
+    padding: 1px 6px;
+    border-radius: 4px;
+  }
   .error {
     color: #b00020;
     font-size: 13px;
+  }
+  .drop-overlay {
+    position: fixed;
+    inset: 0;
+    background: rgba(41, 82, 227, 0.08);
+    border: 3px dashed #2952e3;
+    border-radius: 12px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    pointer-events: none;
+    z-index: 50;
+  }
+  .drop-card {
+    background: #2952e3;
+    color: #fff;
+    font-size: 18px;
+    font-weight: 600;
+    padding: 18px 28px;
+    border-radius: 12px;
+    box-shadow: 0 8px 30px rgba(0, 0, 0, 0.2);
   }
   .transcript-panel {
     display: flex;
@@ -419,8 +521,12 @@
       background: #1a1a1c;
     }
     .meta,
-    .model-picker label {
+    .model-picker label,
+    .hint {
       color: #bbb;
+    }
+    .hint code {
+      background: rgba(255, 255, 255, 0.08);
     }
     .secondary:hover:not(:disabled) {
       background: #333336;
