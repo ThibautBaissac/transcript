@@ -103,4 +103,51 @@ mod tests {
             out.len()
         );
     }
+
+    #[test]
+    fn empty_input_returns_empty() {
+        // No frames → downmix is empty → resampler is never constructed (early return).
+        let out = to_whisper_input(&[], 16_000, 1).unwrap();
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn channels_zero_is_treated_as_mono() {
+        // `channels.max(1)` guards against spec glitches; passthrough at 16k should survive.
+        let input = vec![0.1, 0.2];
+        let out = to_whisper_input(&input, 16_000, 0).unwrap();
+        assert_eq!(out, input);
+    }
+
+    #[test]
+    fn stereo_resample_48k_to_16k_downmixes_and_shortens() {
+        // 0.5s of stereo at 48k → 0.5s mono at 16k, so ~8000 samples (with tail slack).
+        let frames = 24_000; // 0.5s at 48k
+        let mut interleaved = Vec::with_capacity(frames * 2);
+        for i in 0..frames {
+            let v = (i as f32 * 0.02).sin();
+            interleaved.push(v); // L
+            interleaved.push(-v); // R (sum→0, so mono is zero-mean)
+        }
+        let out = to_whisper_input(&interleaved, 48_000, 2).unwrap();
+        assert!(
+            (out.len() as i64 - 8_000).abs() < 1_500,
+            "unexpected output length: {}",
+            out.len()
+        );
+    }
+
+    #[test]
+    fn resample_leaves_residual_chunk_runs_trailing_branch() {
+        // Input size not a multiple of the 1024-frame chunk size → the "trailing partial
+        // chunk" branch fires. 1500 frames forces one full chunk + a 476-frame tail.
+        let input: Vec<f32> = (0..1500).map(|i| (i as f32 * 0.01).sin()).collect();
+        let out = to_whisper_input(&input, 48_000, 1).unwrap();
+        // 1500 * 16/48 = 500, allow slack.
+        assert!(
+            (out.len() as i64 - 500).abs() < 200,
+            "unexpected trailing output length: {}",
+            out.len()
+        );
+    }
 }

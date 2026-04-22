@@ -262,3 +262,290 @@ fn unzip(zip_path: &Path, dest_dir: &Path) -> Result<()> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    #[test]
+    fn parse_accepts_all_slugs_roundtrip() {
+        for id in ModelId::ALL {
+            assert_eq!(ModelId::parse(id.slug()).unwrap(), *id);
+        }
+    }
+
+    #[test]
+    fn parse_is_case_insensitive() {
+        assert_eq!(ModelId::parse("BASE.EN").unwrap(), ModelId::BaseEn);
+        assert_eq!(ModelId::parse("Large-V3-Turbo").unwrap(), ModelId::LargeV3Turbo);
+    }
+
+    #[test]
+    fn parse_errors_on_unknown() {
+        let err = ModelId::parse("tiny.en").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("unknown model 'tiny.en'"), "msg: {msg}");
+        // Every valid slug should appear in the error hint so users can recover.
+        for id in ModelId::ALL {
+            assert!(msg.contains(id.slug()), "missing slug {} in: {msg}", id.slug());
+        }
+    }
+
+    #[test]
+    fn display_matches_slug() {
+        assert_eq!(format!("{}", ModelId::BaseEn), "base.en");
+        assert_eq!(format!("{}", ModelId::LargeV3Turbo), "large-v3-turbo");
+    }
+
+    #[test]
+    fn all_contains_five_variants_with_distinct_slugs() {
+        assert_eq!(ModelId::ALL.len(), 5);
+        let slugs: Vec<&str> = ModelId::ALL.iter().map(|m| m.slug()).collect();
+        let mut deduped = slugs.clone();
+        deduped.sort();
+        deduped.dedup();
+        assert_eq!(slugs.len(), deduped.len(), "duplicate slugs: {slugs:?}");
+    }
+
+    #[test]
+    fn display_name_is_nonempty_for_all_variants() {
+        for id in ModelId::ALL {
+            assert!(!id.display_name().is_empty());
+        }
+    }
+
+    #[test]
+    fn has_coreml_encoder_true_for_all_currently_supported() {
+        for id in ModelId::ALL {
+            assert!(id.has_coreml_encoder(), "{:?} should have coreml", id);
+        }
+    }
+
+    #[test]
+    fn ggml_filename_follows_convention() {
+        assert_eq!(ModelId::BaseEn.ggml_filename(), "ggml-base.en.bin");
+        assert_eq!(
+            ModelId::LargeV3Turbo.coreml_zip_filename(),
+            "ggml-large-v3-turbo-encoder.mlmodelc.zip"
+        );
+        assert_eq!(
+            ModelId::LargeV3Turbo.coreml_dir_filename(),
+            "ggml-large-v3-turbo-encoder.mlmodelc"
+        );
+    }
+
+    #[test]
+    fn download_stage_as_str_variants() {
+        assert_eq!(DownloadStage::Ggml.as_str(), "ggml");
+        assert_eq!(DownloadStage::CoreMl.as_str(), "coreml");
+    }
+
+    #[test]
+    fn modelid_serde_uses_kebab_case() {
+        assert_eq!(
+            serde_json::to_string(&ModelId::LargeV3Turbo).unwrap(),
+            "\"large-v3-turbo\""
+        );
+        let parsed: ModelId = serde_json::from_str("\"base-en\"").unwrap();
+        assert_eq!(parsed, ModelId::BaseEn);
+    }
+
+    #[test]
+    fn download_stage_serde_uses_kebab_case() {
+        assert_eq!(serde_json::to_string(&DownloadStage::CoreMl).unwrap(), "\"core-ml\"");
+    }
+
+    #[test]
+    fn cache_dir_and_transcripts_dir_share_app_parent() {
+        let c = cache_dir().unwrap();
+        let t = transcripts_dir().unwrap();
+        assert_eq!(c.file_name().and_then(|s| s.to_str()), Some("models"));
+        assert_eq!(t.file_name().and_then(|s| s.to_str()), Some("transcripts"));
+        assert_eq!(c.parent(), t.parent());
+        assert_eq!(
+            c.parent().and_then(|p| p.file_name()).and_then(|s| s.to_str()),
+            Some(APP_DIR_NAME),
+        );
+    }
+
+    #[test]
+    fn model_info_reports_absent_files_without_error() {
+        // model_info must work even when the cache dir hasn't been created, so the GUI can
+        // display "not downloaded" rows before the user downloads anything.
+        let info = model_info(ModelId::BaseEn).unwrap();
+        assert_eq!(info.id, ModelId::BaseEn);
+        assert!(info.ggml_path.ends_with("ggml-base.en.bin"));
+        assert_eq!(info.ggml_present, info.ggml_path.exists());
+        let expected_coreml = info.ggml_path.parent().unwrap().join("ggml-base.en-encoder.mlmodelc");
+        assert_eq!(info.coreml_dir.as_deref(), Some(expected_coreml.as_path()));
+        assert_eq!(info.coreml_present, expected_coreml.exists());
+    }
+
+    #[test]
+    fn unzip_errors_on_nonexistent_file() {
+        let tmp = std::env::temp_dir();
+        let err = unzip(Path::new("/nonexistent/path/foo.zip"), &tmp);
+        assert!(err.is_err());
+    }
+
+    // Runs `zip` if present; ships with macOS so this is reliable on dev machines.
+    // Skipped when `zip` is missing to keep CI-like environments green.
+    #[test]
+    fn unzip_extracts_a_real_zip() {
+        let workdir = std::env::temp_dir()
+            .join(format!("transcript-unzip-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&workdir);
+        fs::create_dir_all(&workdir).unwrap();
+        let inner = workdir.join("payload.txt");
+        fs::write(&inner, b"hello").unwrap();
+        let zip_path = workdir.join("bundle.zip");
+        let zipped = std::process::Command::new("zip")
+            .arg("-j")
+            .arg(&zip_path)
+            .arg(&inner)
+            .status();
+        let Ok(status) = zipped else {
+            let _ = fs::remove_dir_all(&workdir);
+            return; // `zip` CLI unavailable.
+        };
+        if !status.success() {
+            let _ = fs::remove_dir_all(&workdir);
+            return;
+        }
+        let dest = workdir.join("out");
+        fs::create_dir_all(&dest).unwrap();
+        unzip(&zip_path, &dest).unwrap();
+        assert_eq!(fs::read(dest.join("payload.txt")).unwrap(), b"hello");
+        let _ = fs::remove_dir_all(&workdir);
+    }
+
+    #[tokio::test]
+    async fn download_to_file_cleans_up_partial_on_http_error() {
+        // 127.0.0.1:1 is an unassignable port; the connection attempt fails synchronously
+        // in reqwest, ensuring we hit the error-cleanup branch without relying on DNS or
+        // flaky network conditions.
+        let tmp = std::env::temp_dir()
+            .join(format!("transcript-dl-{}.bin", std::process::id()));
+        let _ = fs::remove_file(&tmp);
+        let _ = fs::remove_file(tmp.with_extension("partial"));
+
+        let res = download_to_file("http://127.0.0.1:1/nope", &tmp, |_, _| {}).await;
+        assert!(res.is_err());
+        assert!(!tmp.with_extension("partial").exists(), "orphan .partial not cleaned up");
+        assert!(!tmp.exists(), "destination should not exist after failed download");
+    }
+
+    // Serves a single canned HTTP response on a free loopback port. Returns the bound
+    // port so the caller can build a URL against it. Dies after the first connection —
+    // we intentionally don't `accept` a second time, so there's nothing to clean up.
+    fn serve_canned_once(body: Vec<u8>, status: &'static str) -> u16 {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut scratch = [0u8; 4096];
+                let _ = stream.read(&mut scratch);
+                let header = format!(
+                    "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(header.as_bytes());
+                let _ = stream.write_all(&body);
+                let _ = stream.flush();
+            }
+        });
+        port
+    }
+
+    #[tokio::test]
+    async fn download_to_file_succeeds_and_reports_progress() {
+        let body = b"0123456789abcdef".to_vec();
+        let port = serve_canned_once(body.clone(), "200 OK");
+
+        let dest = std::env::temp_dir().join(format!(
+            "transcript-dl-ok-{}-{}.bin",
+            std::process::id(),
+            port
+        ));
+        let _ = fs::remove_file(&dest);
+
+        let mut last_downloaded = 0u64;
+        let mut last_total: Option<u64> = None;
+        download_to_file(
+            &format!("http://127.0.0.1:{port}/"),
+            &dest,
+            |d, t| {
+                last_downloaded = d;
+                last_total = t;
+            },
+        )
+        .await
+        .unwrap();
+
+        // File should be written atomically and the .partial should be gone.
+        assert!(dest.exists());
+        assert!(!dest.with_extension("partial").exists());
+        assert_eq!(fs::read(&dest).unwrap(), body);
+        // Progress callback fired with the final bytes.
+        assert_eq!(last_downloaded, body.len() as u64);
+        assert_eq!(last_total, Some(body.len() as u64));
+        let _ = fs::remove_file(&dest);
+    }
+
+    #[tokio::test]
+    async fn download_to_file_errors_on_http_404() {
+        // 4xx response → error_for_status fails → .partial is cleaned up.
+        let port = serve_canned_once(b"not found".to_vec(), "404 Not Found");
+        let dest = std::env::temp_dir().join(format!(
+            "transcript-dl-404-{}-{}.bin",
+            std::process::id(),
+            port
+        ));
+        let _ = fs::remove_file(&dest);
+
+        let res = download_to_file(&format!("http://127.0.0.1:{port}/"), &dest, |_, _| {}).await;
+        assert!(res.is_err());
+        assert!(!dest.exists());
+        assert!(!dest.with_extension("partial").exists());
+    }
+
+    #[tokio::test]
+    async fn resolve_model_is_noop_when_files_already_present() {
+        // If both ggml and coreml are already on disk, `resolve_model` should skip the
+        // download branches entirely. We only run this check when that's actually the case
+        // on the current machine — otherwise the function would reach out to HF and we'd
+        // be doing an integration test against the network.
+        let info_before = model_info(ModelId::BaseEn).unwrap();
+        if !(info_before.ggml_present && info_before.coreml_present) {
+            return;
+        }
+        let mut progress_called = false;
+        let info_after = resolve_model(ModelId::BaseEn, |_, _, _| progress_called = true)
+            .await
+            .unwrap();
+        assert!(info_after.ggml_present);
+        assert!(info_after.coreml_present);
+        // No download means no progress callback invocation.
+        assert!(!progress_called);
+    }
+
+    #[test]
+    fn unzip_errors_on_non_zip_file() {
+        // Create a file that is definitely not a zip archive and verify the system-level
+        // `unzip` reports a non-zero exit status — we translate that into anyhow::Err.
+        let workdir = std::env::temp_dir()
+            .join(format!("transcript-unzip-bad-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&workdir);
+        fs::create_dir_all(&workdir).unwrap();
+        let bad_zip = workdir.join("not-a-zip.zip");
+        fs::write(&bad_zip, b"this is plain text, not a zip archive at all").unwrap();
+        let dest = workdir.join("out");
+        fs::create_dir_all(&dest).unwrap();
+        let err = unzip(&bad_zip, &dest).unwrap_err();
+        assert!(err.to_string().contains("unzip"), "err: {err}");
+        let _ = fs::remove_dir_all(&workdir);
+    }
+}

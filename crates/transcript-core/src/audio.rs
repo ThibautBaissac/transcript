@@ -413,6 +413,8 @@ pub enum StopReason {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::path::PathBuf;
 
     #[test]
     fn decode_file_errors_on_missing() {
@@ -431,6 +433,63 @@ mod tests {
             );
             assert!(r.is_err(), "expected rejection for threshold {}", bad);
         }
+    }
+
+    /// Exercises the full `record_until_silence` loop for a short window. Skips when no
+    /// microphone is available so CI stays green. The window is short enough that we'll
+    /// hit the MaxDuration branch even if the user is in a quiet room.
+    #[test]
+    fn record_until_silence_runs_and_reports_events() {
+        // Probe for mic availability first; if cpal can't open an input, skip silently.
+        let probe = match start_capture(|_| {}) {
+            Ok(h) => h,
+            Err(_) => return,
+        };
+        drop(probe);
+
+        let mut started_seen = false;
+        let mut level_seen = false;
+        let mut stopped_seen = false;
+        let rec = record_until_silence(
+            std::time::Duration::from_millis(300),
+            std::time::Duration::from_millis(200),
+            0.01,
+            |ev| match ev {
+                RecordEvent::Started { .. } => started_seen = true,
+                RecordEvent::Level { .. } => level_seen = true,
+                RecordEvent::Stopped { .. } => stopped_seen = true,
+            },
+        )
+        .unwrap();
+        assert!(started_seen);
+        assert!(stopped_seen);
+        // Level events depend on the audio thread delivering at least one buffer within
+        // 300ms — usually it does, but we don't require it if the polling was too fast.
+        let _ = level_seen;
+        assert!(rec.sample_rate > 0);
+        assert!(rec.channels >= 1);
+        assert!(rec.duration_seconds >= 0.0);
+    }
+
+    #[test]
+    fn record_until_silence_rejects_zero_durations() {
+        // max_duration == 0 is invalid regardless of silence_duration.
+        let r = record_until_silence(
+            std::time::Duration::from_millis(0),
+            std::time::Duration::from_millis(10),
+            0.01,
+            |_| {},
+        );
+        assert!(r.is_err());
+
+        // silence_duration == 0 would never trigger silence detection.
+        let r = record_until_silence(
+            std::time::Duration::from_millis(10),
+            std::time::Duration::from_millis(0),
+            0.01,
+            |_| {},
+        );
+        assert!(r.is_err());
     }
 
     // Requires a default input device; skipped gracefully when cpal can't open one
@@ -459,5 +518,232 @@ mod tests {
         // Dropping the handle should signal the owner thread to exit and join it.
         // If this test ever hangs, the Drop impl is broken.
         drop(handle);
+    }
+
+    fn tmp_path(name: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!(
+            "transcript-audio-{}-{}",
+            name,
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(&d).unwrap();
+        d.join(format!("{name}.wav"))
+    }
+
+    fn write_wav_s16(path: &std::path::Path, channels: u16, sr: u32, samples: &[i16]) {
+        let spec = hound::WavSpec {
+            channels,
+            sample_rate: sr,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut w = hound::WavWriter::create(path, spec).unwrap();
+        for s in samples {
+            w.write_sample(*s).unwrap();
+        }
+        w.finalize().unwrap();
+    }
+
+    fn write_wav_f32(path: &std::path::Path, channels: u16, sr: u32, samples: &[f32]) {
+        let spec = hound::WavSpec {
+            channels,
+            sample_rate: sr,
+            bits_per_sample: 32,
+            sample_format: hound::SampleFormat::Float,
+        };
+        let mut w = hound::WavWriter::create(path, spec).unwrap();
+        for s in samples {
+            w.write_sample(*s).unwrap();
+        }
+        w.finalize().unwrap();
+    }
+
+    #[test]
+    fn decode_file_reads_s16_mono_wav() {
+        let p = tmp_path("s16_mono");
+        let samples: Vec<i16> = (0..1000).map(|i| (i as i16) * 10).collect();
+        write_wav_s16(&p, 1, 16_000, &samples);
+
+        let a = decode_file(&p).unwrap();
+        assert_eq!(a.sample_rate, 16_000);
+        assert_eq!(a.channels, 1);
+        assert_eq!(a.samples.len(), samples.len());
+        // Mapping: i16 / 32768.0 — check first nonzero sample.
+        assert!((a.samples[1] - (10.0 / 32768.0)).abs() < 1e-6);
+
+        let _ = fs::remove_dir_all(p.parent().unwrap());
+    }
+
+    #[test]
+    fn decode_file_reads_s16_stereo_wav_interleaved() {
+        let p = tmp_path("s16_stereo");
+        // Interleaved L/R: [L0, R0, L1, R1, ...]
+        let samples: Vec<i16> = vec![100, -100, 200, -200, 300, -300];
+        write_wav_s16(&p, 2, 48_000, &samples);
+
+        let a = decode_file(&p).unwrap();
+        assert_eq!(a.sample_rate, 48_000);
+        assert_eq!(a.channels, 2);
+        assert_eq!(a.samples.len(), samples.len());
+        // Ordering must preserve interleave so `downmix_to_mono` works correctly.
+        assert!(a.samples[0] > 0.0);
+        assert!(a.samples[1] < 0.0);
+
+        let _ = fs::remove_dir_all(p.parent().unwrap());
+    }
+
+    #[test]
+    fn decode_file_reads_f32_wav() {
+        let p = tmp_path("f32_mono");
+        let samples: Vec<f32> = (0..800).map(|i| (i as f32 * 0.001).sin()).collect();
+        write_wav_f32(&p, 1, 16_000, &samples);
+
+        let a = decode_file(&p).unwrap();
+        assert_eq!(a.channels, 1);
+        assert_eq!(a.sample_rate, 16_000);
+        assert_eq!(a.samples.len(), samples.len());
+        // F32 path should be ~identity (within decoder precision).
+        for (got, want) in a.samples.iter().zip(samples.iter()) {
+            assert!((got - want).abs() < 1e-4);
+        }
+        let _ = fs::remove_dir_all(p.parent().unwrap());
+    }
+
+    #[test]
+    fn decode_file_reads_u8_wav() {
+        // WAV's 8-bit PCM is unsigned — exercises the `U8` branch of append_samples_f32.
+        let p = tmp_path("u8_mono");
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 16_000,
+            bits_per_sample: 8,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut w = hound::WavWriter::create(&p, spec).unwrap();
+        // Hound's 8-bit Int writer accepts i8 samples but stores them as unsigned bytes.
+        for v in [-100i8, -50, 0, 50, 100] {
+            w.write_sample(v as i32).unwrap();
+        }
+        w.finalize().unwrap();
+
+        let a = decode_file(&p).unwrap();
+        assert_eq!(a.channels, 1);
+        assert_eq!(a.sample_rate, 16_000);
+        assert_eq!(a.samples.len(), 5);
+        // Centered around 0 after the `(s - 128) / 128` normalization.
+        assert!(a.samples.iter().all(|s| s.abs() <= 1.0));
+        let _ = fs::remove_dir_all(p.parent().unwrap());
+    }
+
+    #[test]
+    fn decode_file_reads_s24_wav() {
+        let p = tmp_path("s24_mono");
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 16_000,
+            bits_per_sample: 24,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut w = hound::WavWriter::create(&p, spec).unwrap();
+        // 24-bit max signed = 2^23 - 1 = 8_388_607. Write a peak and midpoint.
+        for v in [0i32, 1 << 22, -(1 << 22)] {
+            w.write_sample(v).unwrap();
+        }
+        w.finalize().unwrap();
+
+        let a = decode_file(&p).unwrap();
+        assert_eq!(a.samples.len(), 3);
+        assert!((a.samples[0]).abs() < 1e-6);
+        assert!((a.samples[1] - 0.5).abs() < 1e-3);
+        assert!((a.samples[2] + 0.5).abs() < 1e-3);
+        let _ = fs::remove_dir_all(p.parent().unwrap());
+    }
+
+    #[test]
+    fn decode_file_reads_s32_wav() {
+        let p = tmp_path("s32_mono");
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 16_000,
+            bits_per_sample: 32,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut w = hound::WavWriter::create(&p, spec).unwrap();
+        for v in [0i32, 1 << 30, -(1 << 30)] {
+            w.write_sample(v).unwrap();
+        }
+        w.finalize().unwrap();
+
+        let a = decode_file(&p).unwrap();
+        assert_eq!(a.samples.len(), 3);
+        assert!((a.samples[0]).abs() < 1e-6);
+        assert!((a.samples[1] - 0.5).abs() < 1e-3);
+        assert!((a.samples[2] + 0.5).abs() < 1e-3);
+        let _ = fs::remove_dir_all(p.parent().unwrap());
+    }
+
+    #[test]
+    fn decode_file_errors_on_non_audio_input() {
+        let p = tmp_path("garbage");
+        fs::write(&p, b"this is not an audio file at all").unwrap();
+        assert!(decode_file(&p).is_err());
+        let _ = fs::remove_dir_all(p.parent().unwrap());
+    }
+
+    #[test]
+    fn rms_zero_for_empty_input() {
+        assert_eq!(rms(&[]), 0.0);
+    }
+
+    #[test]
+    fn rms_matches_formula_for_known_signal() {
+        // RMS of [1, -1, 1, -1] = sqrt((1+1+1+1)/4) = 1.0
+        assert!((rms(&[1.0, -1.0, 1.0, -1.0]) - 1.0).abs() < 1e-6);
+        // RMS of zero-signal is zero.
+        assert_eq!(rms(&[0.0, 0.0, 0.0]), 0.0);
+    }
+
+    #[test]
+    fn push_and_meter_is_noop_on_empty_input() {
+        let buf: Arc<Mutex<Vec<f32>>> = Arc::new(Mutex::new(Vec::new()));
+        let mut called_with: Option<f32> = None;
+        let mut cb = |rms: f32| called_with = Some(rms);
+        push_and_meter(&[], &buf, &mut cb);
+        assert!(buf.lock().is_empty());
+        // Callback must NOT have been invoked for an empty buffer — otherwise the VU
+        // meter would get spurious zero-level events on audio thread warmup.
+        assert!(called_with.is_none());
+    }
+
+    #[test]
+    fn push_and_meter_appends_and_reports_rms() {
+        let buf: Arc<Mutex<Vec<f32>>> = Arc::new(Mutex::new(vec![0.5]));
+        let mut last_rms = 0.0_f32;
+        let mut cb = |r: f32| last_rms = r;
+        push_and_meter(&[1.0, -1.0], &buf, &mut cb);
+        assert_eq!(&*buf.lock(), &[0.5, 1.0, -1.0]);
+        assert!((last_rms - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn stop_reason_equality() {
+        // StopReason is compared by callers to choose an emoji; derive(PartialEq) must hold.
+        assert_eq!(StopReason::Silence, StopReason::Silence);
+        assert_ne!(StopReason::Silence, StopReason::MaxDuration);
+    }
+
+    #[test]
+    fn record_event_variants_are_debug_printable() {
+        // Debug output feeds diagnostic logs — exercise each variant so no derive gets lost.
+        let variants = [
+            RecordEvent::Started { sample_rate: 48_000, channels: 1 },
+            RecordEvent::Level { rms: 0.1, elapsed_secs: 0.5 },
+            RecordEvent::Stopped { reason: StopReason::Silence, duration_seconds: 1.0 },
+        ];
+        for v in variants {
+            let s = format!("{:?}", v);
+            assert!(!s.is_empty());
+        }
     }
 }

@@ -245,3 +245,121 @@ pub async fn load_transcript(id: String) -> Result<TranscriptRecord, String> {
 pub async fn delete_transcript(id: String) -> Result<(), String> {
     run_blocking(move || transcripts::delete(&id)).await
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    #[test]
+    fn model_entry_build_copies_flags_from_info() {
+        let info = ModelInfo {
+            id: ModelId::BaseEn,
+            ggml_path: PathBuf::from("/tmp/ggml-base.en.bin"),
+            coreml_dir: Some(PathBuf::from("/tmp/ggml-base.en-encoder.mlmodelc")),
+            ggml_present: true,
+            coreml_present: false,
+        };
+        let e = ModelEntry::build(ModelId::BaseEn, Some(&info));
+        assert_eq!(e.id, ModelId::BaseEn);
+        assert_eq!(e.display, ModelId::BaseEn.display_name());
+        assert!(e.ggml_present);
+        assert!(!e.coreml_present);
+    }
+
+    #[test]
+    fn model_entry_build_with_none_info_reports_absent() {
+        let e = ModelEntry::build(ModelId::SmallEn, None);
+        assert!(!e.ggml_present);
+        assert!(!e.coreml_present);
+        assert!(!e.display.is_empty());
+    }
+
+    #[test]
+    fn model_entry_for_id_matches_model_info() {
+        // Must agree with the filesystem view from `model_info` — if model_info says
+        // the ggml is there, ModelEntry should too.
+        let info = model_info(ModelId::BaseEn).unwrap();
+        let e = ModelEntry::for_id(ModelId::BaseEn);
+        assert_eq!(e.id, info.id);
+        assert_eq!(e.ggml_present, info.ggml_present);
+        assert_eq!(e.coreml_present, info.coreml_present);
+    }
+
+    #[test]
+    fn list_models_returns_entry_per_variant() {
+        let models = list_models();
+        assert_eq!(models.len(), ModelId::ALL.len());
+        let got: Vec<ModelId> = models.iter().map(|m| m.id).collect();
+        let want: Vec<ModelId> = ModelId::ALL.to_vec();
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    fn model_status_returns_entry_for_known_id() {
+        let e = model_status(ModelId::BaseEn).unwrap();
+        assert_eq!(e.id, ModelId::BaseEn);
+    }
+
+    #[test]
+    fn opts_wraps_lang_preserving_other_defaults() {
+        let o = opts(Some("fr".into()));
+        assert_eq!(o.language.as_deref(), Some("fr"));
+        assert_eq!(o.temperature, 0.0);
+        assert!(o.threads.is_none());
+        assert!(o.initial_prompt.is_none());
+
+        let o = opts(None);
+        assert!(o.language.is_none());
+    }
+
+    #[test]
+    fn download_progress_serializes_with_stage_string() {
+        // Frontend consumes `stage` as a string tag — lock the JSON shape.
+        let p = DownloadProgress {
+            model: ModelId::BaseEn,
+            stage: "ggml",
+            downloaded: 42,
+            total: Some(100),
+        };
+        let json = serde_json::to_string(&p).unwrap();
+        assert!(json.contains("\"stage\":\"ggml\""));
+        assert!(json.contains("\"downloaded\":42"));
+        assert!(json.contains("\"total\":100"));
+    }
+
+    #[test]
+    fn recording_level_serializes_as_rms_field() {
+        let r = RecordingLevel { rms: 0.25 };
+        assert_eq!(serde_json::to_string(&r).unwrap(), r#"{"rms":0.25}"#);
+    }
+
+    #[test]
+    fn recording_info_serializes_all_fields() {
+        let i = RecordingInfo {
+            duration_seconds: 1.5,
+            sample_rate: 48_000,
+            channels: 2,
+        };
+        let json = serde_json::to_string(&i).unwrap();
+        assert!(json.contains("duration_seconds"));
+        assert!(json.contains("sample_rate"));
+        assert!(json.contains("channels"));
+    }
+
+    #[tokio::test]
+    async fn run_blocking_returns_ok_on_success() {
+        let v = run_blocking(|| Ok::<_, anyhow::Error>(42)).await.unwrap();
+        assert_eq!(v, 42);
+    }
+
+    #[tokio::test]
+    async fn run_blocking_surfaces_error_as_string() {
+        let err = run_blocking(|| {
+            Err::<(), _>(anyhow::anyhow!("boom"))
+        })
+        .await
+        .unwrap_err();
+        assert!(err.contains("boom"));
+    }
+}

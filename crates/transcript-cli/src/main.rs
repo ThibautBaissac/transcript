@@ -7,8 +7,8 @@ use clap::{Parser, ValueEnum};
 use indicatif::{ProgressBar, ProgressStyle};
 use transcript_core::audio::{RecordEvent, StopReason, record_until_silence};
 use transcript_core::{
-    DownloadStage, Engine, ModelId, TranscribeOptions, format_json, format_srt, format_txt,
-    resolve_model,
+    DownloadStage, Engine, ModelId, TranscribeOptions, TranscriptResult, format_json, format_srt,
+    format_txt, resolve_model,
 };
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -134,10 +134,7 @@ async fn main() -> Result<()> {
                 silence_duration,
                 threshold,
                 |ev| if let RecordEvent::Stopped { reason, duration_seconds } = ev {
-                    let how = match reason {
-                        StopReason::Silence => "silence",
-                        StopReason::MaxDuration => "max duration",
-                    };
+                    let how = stop_reason_label(reason);
                     if show_cues {
                         play_cue("/System/Library/Sounds/Pop.aiff");
                         notify(
@@ -171,16 +168,31 @@ async fn main() -> Result<()> {
             .context("transcription thread panicked")??
     };
 
-    let output = match args.format {
-        Format::Txt => format_txt(&result),
-        Format::Srt => format_srt(&result),
-        Format::Json => format_json(&result),
-    };
+    let output = format_output(args.format, &result);
 
     let stdout = std::io::stdout();
     let mut lock = stdout.lock();
     writeln!(lock, "{}", output)?;
     Ok(())
+}
+
+/// Maps a CLI `Format` choice to a string rendering of the transcript. Kept as a pure
+/// function so the branch selection can be unit tested without running the whole pipeline.
+fn format_output(fmt: Format, result: &TranscriptResult) -> String {
+    match fmt {
+        Format::Txt => format_txt(result),
+        Format::Srt => format_srt(result),
+        Format::Json => format_json(result),
+    }
+}
+
+/// Maps a `StopReason` to a short human label used in the CLI's status message and
+/// macOS notification subtitle.
+fn stop_reason_label(reason: StopReason) -> &'static str {
+    match reason {
+        StopReason::Silence => "silence",
+        StopReason::MaxDuration => "max duration",
+    }
 }
 
 /// Plays a short system sound synchronously via `afplay` — used to signal that the
@@ -212,4 +224,94 @@ fn notify(title: &str, message: &str, subtitle: &str) {
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    #[test]
+    fn clap_command_validates() {
+        // `debug_assert` inside clap fires if the attribute tree is malformed. This
+        // guards against a future arg refactor silently breaking the CLI.
+        Args::command().debug_assert();
+    }
+
+    #[test]
+    fn default_args_pick_turbo_model_and_txt_format() {
+        let args = Args::try_parse_from(["transcript", "file.wav"]).unwrap();
+        assert_eq!(args.model, "large-v3-turbo");
+        assert!(matches!(args.format, Format::Txt));
+        assert_eq!(args.audio.as_deref(), Some(std::path::Path::new("file.wav")));
+        assert!(!args.record);
+    }
+
+    #[test]
+    fn record_and_audio_are_mutually_exclusive() {
+        let err = Args::try_parse_from(["transcript", "--record", "file.wav"]).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("cannot be used with") || msg.contains("conflicts"), "msg: {msg}");
+    }
+
+    #[test]
+    fn format_json_is_parsed() {
+        let args = Args::try_parse_from(["transcript", "-f", "json", "file.wav"]).unwrap();
+        assert!(matches!(args.format, Format::Json));
+    }
+
+    #[test]
+    fn format_srt_is_parsed() {
+        let args = Args::try_parse_from(["transcript", "--format", "srt", "file.wav"]).unwrap();
+        assert!(matches!(args.format, Format::Srt));
+    }
+
+    #[test]
+    fn record_mode_accepts_no_audio_path() {
+        let args = Args::try_parse_from(["transcript", "--record"]).unwrap();
+        assert!(args.record);
+        assert!(args.audio.is_none());
+    }
+
+    #[test]
+    fn play_cue_silent_on_missing_file_does_not_panic() {
+        // Non-existent path → `afplay` exits non-zero → we ignore it silently.
+        play_cue("/definitely/not/a/sound.aiff");
+    }
+
+    #[test]
+    fn notify_does_not_panic_on_quotes_or_backslashes() {
+        // Exercises the AppleScript escape path. We can't assert the notification was
+        // shown (it's fire-and-forget spawn), but we can assert we didn't panic.
+        notify("ti\"tle", "mes\\sage", "sub\"ti\\tle");
+    }
+
+    fn sample_result() -> TranscriptResult {
+        TranscriptResult {
+            text: "hello".into(),
+            segments: vec![transcript_core::Segment {
+                start: 0.0,
+                end: 1.0,
+                text: "hello".into(),
+            }],
+            language: "en".into(),
+        }
+    }
+
+    #[test]
+    fn format_output_dispatches_by_variant() {
+        let r = sample_result();
+        assert_eq!(format_output(Format::Txt, &r), "hello");
+        let srt = format_output(Format::Srt, &r);
+        assert!(srt.contains("00:00:00,000 --> 00:00:01,000"));
+        let json = format_output(Format::Json, &r);
+        assert!(json.starts_with('{'));
+        assert!(json.contains("hello"));
+    }
+
+    #[test]
+    fn stop_reason_labels_are_stable() {
+        assert_eq!(stop_reason_label(StopReason::Silence), "silence");
+        assert_eq!(stop_reason_label(StopReason::MaxDuration), "max duration");
+    }
 }
