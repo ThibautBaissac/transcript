@@ -159,15 +159,19 @@ pub async fn transcribe_current_recording(
     model: ModelId,
     lang: Option<String>,
 ) -> Result<TranscriptResult, String> {
-    let rec = state
-        .last_recording
-        .lock()
-        .take()
-        .ok_or_else(|| "no recording available".to_string())?;
+    // Leave the buffer in place so a subsequent save_transcript can persist it as
+    // a sibling WAV.
+    let (samples, sample_rate, channels) = {
+        let guard = state.last_recording.lock();
+        let rec = guard
+            .as_ref()
+            .ok_or_else(|| "no recording available".to_string())?;
+        (rec.samples.clone(), rec.sample_rate, rec.channels)
+    };
     let engine_slot = state.engine.clone();
     run_blocking(move || {
         let engine = ensure_engine(&engine_slot, model)?;
-        engine.transcribe_recorded(&rec.samples, rec.sample_rate, rec.channels, &opts(lang))
+        engine.transcribe_recorded(&samples, sample_rate, channels, &opts(lang))
     })
     .await
 }
@@ -223,12 +227,22 @@ where
 
 #[tauri::command]
 pub async fn save_transcript(
+    state: State<'_, AppState>,
     model: String,
     source: TranscriptSource,
     duration_secs: Option<f32>,
     result: TranscriptResult,
 ) -> Result<TranscriptRecord, String> {
-    run_blocking(move || transcripts::save(model, source, duration_secs, result)).await
+    let audio = if matches!(source, TranscriptSource::Recording) {
+        state.last_recording.lock().take().map(|r| transcripts::SavedAudio {
+            samples: r.samples,
+            sample_rate: r.sample_rate,
+            channels: r.channels,
+        })
+    } else {
+        None
+    };
+    run_blocking(move || transcripts::save(model, source, duration_secs, result, audio)).await
 }
 
 #[tauri::command]
@@ -244,6 +258,18 @@ pub async fn load_transcript(id: String) -> Result<TranscriptRecord, String> {
 #[tauri::command]
 pub async fn delete_transcript(id: String) -> Result<(), String> {
     run_blocking(move || transcripts::delete(&id)).await
+}
+
+#[tauri::command]
+pub async fn get_transcript_audio_path(
+    id: String,
+    source: TranscriptSource,
+) -> Result<Option<String>, String> {
+    run_blocking(move || {
+        Ok(transcripts::audio_path_if_exists(&id, &source)?
+            .map(|p| p.to_string_lossy().into_owned()))
+    })
+    .await
 }
 
 #[cfg(test)]

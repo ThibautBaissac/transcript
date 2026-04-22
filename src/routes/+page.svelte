@@ -2,6 +2,7 @@
   import { onMount, onDestroy } from "svelte";
   import { save } from "@tauri-apps/plugin-dialog";
   import { writeTextFile } from "@tauri-apps/plugin-fs";
+  import { convertFileSrc } from "@tauri-apps/api/core";
   import type { UnlistenFn } from "@tauri-apps/api/event";
   import { getCurrentWebview } from "@tauri-apps/api/webview";
   import {
@@ -30,12 +31,17 @@
   let elapsed = $state<number>(0);
   let level = $state<number>(0);
   let transcript = $state<TranscriptResult | null>(null);
-  let transcriptText = $state<string>("");
   let droppedFile = $state<string | null>(null);
+  let audioUrl = $state<string | null>(null);
+  let audioEl: HTMLAudioElement | null = $state(null);
+  let currentTime = $state<number>(0);
+  let segmentsContainer: HTMLDivElement | null = $state(null);
   let dragging = $state<boolean>(false);
   let copied = $state<boolean>(false);
   let history = $state<TranscriptSummary[]>([]);
   let currentId = $state<string | null>(null);
+  let query = $state<string>("");
+  let searchInput: HTMLInputElement | null = $state(null);
 
   const selectedEntry = $derived(
     models.find((m) => m.id === selectedModel) ?? null,
@@ -48,6 +54,38 @@
       status.kind === "transcribing" ||
       status.kind === "downloading",
   );
+  const segments = $derived(transcript?.segments ?? []);
+  const joinedText = $derived(
+    transcript
+      ? segments.map((s) => s.text).join(" ").trim() || transcript.text
+      : "",
+  );
+  const activeSegmentIdx = $derived.by(() => {
+    if (!audioUrl || segments.length === 0) return -1;
+    const t = currentTime;
+    // Segments are ordered and usually non-overlapping; linear scan is simple and
+    // robust to the occasional Whisper overlap.
+    for (let i = 0; i < segments.length; i++) {
+      if (t >= segments[i].start && t < segments[i].end) return i;
+    }
+    return -1;
+  });
+
+  const filteredHistory = $derived.by(() => {
+    const q = query.trim().toLowerCase();
+    if (!q) return history;
+    return history.filter((h) => {
+      const hay = [
+        h.preview,
+        sourceLabel(h.source),
+        formatRelative(h.created_at),
+        h.language,
+      ]
+        .join(" ")
+        .toLowerCase();
+      return hay.includes(q);
+    });
+  });
 
   let timerId: number | undefined;
   let pendingListeners: Promise<UnlistenFn>[] = [];
@@ -120,11 +158,11 @@
     try {
       const result = await call();
       transcript = result;
-      transcriptText = result.text;
       const duration = result.segments.at(-1)?.end ?? null;
       const saved = await api.saveTranscript(selectedModel, source, duration, result);
       currentId = saved.id;
       history = [toSummary(saved), ...history];
+      await loadAudioFor(saved.id, source);
       status = { kind: "idle" };
     } catch (e) {
       status = { kind: "error", message: String(e) };
@@ -190,19 +228,54 @@
   }
 
   async function copyToClipboard() {
-    await navigator.clipboard.writeText(transcriptText);
+    await navigator.clipboard.writeText(joinedText);
     copied = true;
     setTimeout(() => (copied = false), 1400);
   }
 
-  async function saveTranscript() {
+  async function saveTranscriptToFile() {
     const path = await save({
       defaultPath: `transcript-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-")}.txt`,
       filters: [{ name: "Text", extensions: ["txt"] }],
     });
     if (!path) return;
-    await writeTextFile(path, transcriptText);
+    await writeTextFile(path, joinedText);
   }
+
+  async function loadAudioFor(id: string, source: TranscriptSource) {
+    try {
+      const path = await api.getTranscriptAudioPath(id, source);
+      audioUrl = path ? convertFileSrc(path) : null;
+    } catch {
+      audioUrl = null;
+    }
+    currentTime = 0;
+  }
+
+  function seekTo(seconds: number) {
+    if (!audioEl) return;
+    audioEl.currentTime = seconds;
+    // Autoplay after a user gesture is allowed by WebKit. If it ever rejects
+    // (e.g. no source yet), swallow the rejection silently.
+    audioEl.play().catch(() => {});
+  }
+
+  function onTimeUpdate(e: Event) {
+    currentTime = (e.currentTarget as HTMLAudioElement).currentTime;
+  }
+
+  $effect(() => {
+    if (activeSegmentIdx < 0 || !segmentsContainer) return;
+    const target = segmentsContainer.querySelector<HTMLButtonElement>(
+      `[data-seg="${activeSegmentIdx}"]`,
+    );
+    if (!target) return;
+    const pr = segmentsContainer.getBoundingClientRect();
+    const tr = target.getBoundingClientRect();
+    if (tr.top < pr.top || tr.bottom > pr.bottom) {
+      target.scrollIntoView({ block: "nearest", behavior: "smooth" });
+    }
+  });
 
   function handleMainClick() {
     if (status.kind === "recording") stopAndTranscribe();
@@ -215,8 +288,8 @@
       const rec = await api.loadTranscript(id);
       currentId = rec.id;
       transcript = rec.result;
-      transcriptText = rec.result.text;
       droppedFile = rec.source.kind === "file" ? rec.source.value : null;
+      await loadAudioFor(rec.id, rec.source);
       status = { kind: "idle" };
     } catch (e) {
       status = { kind: "error", message: String(e) };
@@ -224,10 +297,12 @@
   }
 
   function closeTranscript() {
+    audioEl?.pause();
     transcript = null;
-    transcriptText = "";
     currentId = null;
     droppedFile = null;
+    audioUrl = null;
+    currentTime = 0;
   }
 
   async function removeHistoryItem(id: string, event: MouseEvent) {
@@ -385,40 +460,103 @@
             <svg viewBox="0 0 24 24" width="16" height="16"><rect x="8" y="8" width="12" height="12" rx="2" stroke="currentColor" stroke-width="1.7" fill="none"/><rect x="4" y="4" width="12" height="12" rx="2" stroke="currentColor" stroke-width="1.7" fill="none"/></svg>
           {/if}
         </button>
-        <button class="icon-btn" onclick={saveTranscript} title="Save .txt">
+        <button class="icon-btn" onclick={saveTranscriptToFile} title="Save .txt">
           <svg viewBox="0 0 24 24" width="16" height="16"><path d="M12 3v12m0 0l-4-4m4 4l4-4M5 21h14" stroke="currentColor" stroke-width="1.7" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>
         </button>
       </div>
-      <textarea class="reader-text" bind:value={transcriptText} spellcheck="false"></textarea>
+      {#if audioUrl}
+        <audio
+          class="player"
+          controls
+          preload="metadata"
+          src={audioUrl}
+          bind:this={audioEl}
+          ontimeupdate={onTimeUpdate}
+        ></audio>
+      {:else}
+        <p class="audio-unavailable">Audio unavailable for this transcript.</p>
+      {/if}
+      <div class="segments" bind:this={segmentsContainer}>
+        {#if segments.length > 0}
+          {#each segments as seg, i (i)}
+            <button
+              type="button"
+              class="segment"
+              class:active={i === activeSegmentIdx}
+              data-seg={i}
+              onclick={() => seekTo(seg.start)}
+              title={`Seek to ${fmtDuration(seg.start)}`}
+            >{seg.text}</button>
+          {/each}
+        {:else}
+          <p class="segments-empty">{transcript.text}</p>
+        {/if}
+      </div>
     {:else if history.length > 0}
       <header class="list-header">
         <h2>History</h2>
-        <span class="count">{history.length}</span>
+        <span class="count">
+          {#if query.trim()}{filteredHistory.length} / {history.length}{:else}{history.length}{/if}
+        </span>
       </header>
-      <ul class="history-list">
-        {#each history as h (h.id)}
-          <li class="history-item">
-            <button class="history-row" onclick={() => openTranscript(h.id)}>
-              <div class="row-meta">
-                <span class="row-date">{formatRelative(h.created_at)}</span>
-                <span class="row-tags">
-                  <span class="tag">{sourceLabel(h.source)}</span>
-                  <span class="tag subtle">{h.language}</span>
-                </span>
-              </div>
-              <p class="row-preview">{h.preview || "(empty transcript)"}</p>
-            </button>
-            <button
-              class="row-delete"
-              title="Delete"
-              aria-label="Delete transcript"
-              onclick={(e) => removeHistoryItem(h.id, e)}
-            >
-              <svg viewBox="0 0 24 24" width="14" height="14"><path d="M6 6l12 12M18 6L6 18" stroke="currentColor" stroke-width="1.8" fill="none" stroke-linecap="round"/></svg>
-            </button>
-          </li>
-        {/each}
-      </ul>
+      <div class="search-row">
+        <svg class="search-icon" viewBox="0 0 24 24" width="14" height="14" aria-hidden="true">
+          <circle cx="11" cy="11" r="6" stroke="currentColor" stroke-width="1.7" fill="none"/>
+          <path d="M20 20l-4-4" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/>
+        </svg>
+        <input
+          bind:this={searchInput}
+          bind:value={query}
+          type="search"
+          class="search-input"
+          placeholder="Filter history"
+          aria-label="Filter history"
+          onkeydown={(e) => {
+            if (e.key === "Escape") {
+              query = "";
+              (e.currentTarget as HTMLInputElement).blur();
+            }
+          }}
+        />
+        {#if query}
+          <button
+            class="search-clear"
+            type="button"
+            aria-label="Clear filter"
+            onclick={() => { query = ""; searchInput?.focus(); }}
+          >
+            <svg viewBox="0 0 24 24" width="12" height="12"><path d="M6 6l12 12M18 6L6 18" stroke="currentColor" stroke-width="1.8" fill="none" stroke-linecap="round"/></svg>
+          </button>
+        {/if}
+      </div>
+      {#if filteredHistory.length === 0}
+        <p class="empty-filter">No matches for “{query}”.</p>
+      {:else}
+        <ul class="history-list">
+          {#each filteredHistory as h (h.id)}
+            <li class="history-item">
+              <button class="history-row" onclick={() => openTranscript(h.id)}>
+                <div class="row-meta">
+                  <span class="row-date">{formatRelative(h.created_at)}</span>
+                  <span class="row-tags">
+                    <span class="tag">{sourceLabel(h.source)}</span>
+                    <span class="tag subtle">{h.language}</span>
+                  </span>
+                </div>
+                <p class="row-preview">{h.preview || "(empty transcript)"}</p>
+              </button>
+              <button
+                class="row-delete"
+                title="Delete"
+                aria-label="Delete transcript"
+                onclick={(e) => removeHistoryItem(h.id, e)}
+              >
+                <svg viewBox="0 0 24 24" width="14" height="14"><path d="M6 6l12 12M18 6L6 18" stroke="currentColor" stroke-width="1.8" fill="none" stroke-linecap="round"/></svg>
+              </button>
+            </li>
+          {/each}
+        </ul>
+      {/if}
     {:else}
       <div class="placeholder">
         <p>Press the button to record, or drop an audio file here.</p>
@@ -629,18 +767,52 @@
   }
   .icon-btn:hover { background: var(--accent-soft); color: var(--accent); }
 
-  .reader-text {
+  .player {
+    display: block;
+    margin: 46px 18px 6px;
+    width: calc(100% - 36px);
+    height: 32px;
+  }
+  .audio-unavailable {
+    margin: 46px 20px 6px;
+    font-size: 12px;
+    color: var(--text-faint);
+    font-style: italic;
+  }
+  .segments {
     flex: 1;
-    width: 100%;
-    padding: 26px 28px;
-    border: none;
-    background: transparent;
+    overflow-y: auto;
+    padding: 10px 24px 22px;
     font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "New York", Georgia, serif;
     font-size: 15px;
-    line-height: 1.65;
+    line-height: 1.7;
     color: var(--text);
-    resize: none;
-    outline: none;
+  }
+  .segments-empty {
+    margin: 0;
+    color: var(--text);
+    white-space: pre-wrap;
+  }
+  .segment {
+    display: inline;
+    padding: 1px 2px;
+    margin: 0;
+    border: none;
+    background: transparent;
+    color: inherit;
+    font: inherit;
+    line-height: inherit;
+    cursor: pointer;
+    border-radius: 3px;
+    transition: background 0.12s ease, color 0.12s ease;
+    text-align: left;
+  }
+  .segment + .segment { margin-left: 0.2em; }
+  .segment:hover { background: var(--accent-soft); color: var(--accent); }
+  .segment:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+  .segment.active {
+    background: var(--accent);
+    color: #fff;
   }
 
   .placeholder {
@@ -673,11 +845,64 @@
     color: var(--text-faint);
     font-variant-numeric: tabular-nums;
   }
+  .search-row {
+    position: relative;
+    padding: 8px 14px;
+    border-bottom: 1px solid var(--border);
+  }
+  .search-icon {
+    position: absolute;
+    left: 22px;
+    top: 50%;
+    transform: translateY(-50%);
+    color: var(--text-faint);
+    pointer-events: none;
+  }
+  .search-input {
+    width: 100%;
+    padding: 6px 28px 6px 30px;
+    border: 1px solid var(--border);
+    background: var(--bg);
+    color: var(--text);
+    border-radius: var(--radius-sm);
+    font: inherit;
+    font-size: 13px;
+    outline: none;
+    transition: border-color 0.12s ease, box-shadow 0.12s ease;
+  }
+  .search-input:focus {
+    border-color: var(--accent);
+    box-shadow: 0 0 0 3px var(--accent-soft);
+  }
+  .search-input::-webkit-search-cancel-button { display: none; }
+  .search-clear {
+    position: absolute;
+    right: 20px;
+    top: 50%;
+    transform: translateY(-50%);
+    width: 20px;
+    height: 20px;
+    border: none;
+    background: transparent;
+    color: var(--text-faint);
+    cursor: pointer;
+    border-radius: 4px;
+    display: grid;
+    place-items: center;
+  }
+  .search-clear:hover { color: var(--text); background: var(--accent-soft); }
+  .empty-filter {
+    margin: 0;
+    padding: 24px 20px;
+    font-size: 13px;
+    color: var(--text-faint);
+    text-align: center;
+  }
   .history-list {
     list-style: none;
     margin: 0;
     padding: 4px 0;
-    max-height: calc(100vh - 280px);
+    max-height: calc(100vh - 320px);
     overflow-y: auto;
   }
   .history-item {

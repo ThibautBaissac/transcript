@@ -12,7 +12,7 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = [] }
+tauri = { version = "2", features = ["protocol-asset"] }
 tauri-plugin-dialog = "2"
 tauri-plugin-fs = "2"
 tauri-plugin-opener = "2"
@@ -21,5 +21,6 @@ serde_json.workspace = true
 anyhow.workspace = true
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros"] }
 parking_lot = "0.12"
+hound = "3"
 
 transcript-core = { path = "../crates/transcript-core" }

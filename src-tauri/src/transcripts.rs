@@ -36,13 +36,20 @@ pub struct TranscriptSummary {
     pub preview: String,
 }
 
+pub struct SavedAudio {
+    pub samples: Vec<f32>,
+    pub sample_rate: u32,
+    pub channels: u16,
+}
+
 pub fn save(
     model: String,
     source: TranscriptSource,
     duration_secs: Option<f32>,
     result: TranscriptResult,
+    audio: Option<SavedAudio>,
 ) -> Result<TranscriptRecord> {
-    save_in(&transcripts_dir()?, model, source, duration_secs, result)
+    save_in(&transcripts_dir()?, model, source, duration_secs, result, audio)
 }
 
 fn save_in(
@@ -51,6 +58,7 @@ fn save_in(
     source: TranscriptSource,
     duration_secs: Option<f32>,
     result: TranscriptResult,
+    audio: Option<SavedAudio>,
 ) -> Result<TranscriptRecord> {
     fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
 
@@ -77,7 +85,82 @@ fn save_in(
     }
     fs::rename(&tmp_path, &final_path)
         .with_context(|| format!("renaming into {}", final_path.display()))?;
+    // JSON is authoritative; a WAV failure degrades to the "audio unavailable" UI
+    // state rather than failing the save.
+    if let Some(audio) = audio {
+        let wav = audio_path(dir, &record.id);
+        if let Err(e) = write_wav_atomic(&wav, &audio.samples, audio.sample_rate, audio.channels) {
+            eprintln!("transcripts: wav write failed for {}: {e:#}", record.id);
+        }
+    }
     Ok(record)
+}
+
+fn write_wav_atomic(
+    path: &Path,
+    samples: &[f32],
+    sample_rate: u32,
+    channels: u16,
+) -> Result<()> {
+    use hound::{SampleFormat, WavSpec, WavWriter};
+    let tmp = path.with_extension("wav.partial");
+    let _ = fs::remove_file(&tmp);
+    let spec = WavSpec {
+        channels,
+        sample_rate,
+        bits_per_sample: 16,
+        sample_format: SampleFormat::Int,
+    };
+    let write_result: Result<()> = (|| {
+        let mut w = WavWriter::create(&tmp, spec)
+            .with_context(|| format!("writing {}", tmp.display()))?;
+        for &s in samples {
+            // cpal peaks can briefly exceed ±1.0; unclamped cast would wrap to negative
+            // and produce clicks on playback.
+            let v = (s.clamp(-1.0, 1.0) * i16::MAX as f32) as i16;
+            w.write_sample(v).with_context(|| "writing sample")?;
+        }
+        w.finalize().with_context(|| "finalizing wav")?;
+        // hound::finalize flushes but doesn't fsync; match the durability of the JSON save.
+        fs::File::open(&tmp)?
+            .sync_all()
+            .with_context(|| "fsync wav")?;
+        Ok(())
+    })();
+    if write_result.is_err() {
+        let _ = fs::remove_file(&tmp);
+        return write_result;
+    }
+    fs::rename(&tmp, path).with_context(|| format!("renaming into {}", path.display()))
+}
+
+fn audio_path(dir: &Path, id: &str) -> PathBuf {
+    dir.join(format!("{}.wav", sanitize_id(id)))
+}
+
+/// Resolve a playable audio path for a transcript without re-reading the JSON.
+/// The caller supplies `source` (already known from the record they just loaded):
+/// recordings use a sibling `<id>.wav`; file sources fall back to the original path.
+pub fn audio_path_if_exists(id: &str, source: &TranscriptSource) -> Result<Option<PathBuf>> {
+    audio_path_if_exists_in(&transcripts_dir()?, id, source)
+}
+
+fn audio_path_if_exists_in(
+    dir: &Path,
+    id: &str,
+    source: &TranscriptSource,
+) -> Result<Option<PathBuf>> {
+    let wav = audio_path(dir, id);
+    if wav.exists() {
+        return Ok(Some(wav));
+    }
+    if let TranscriptSource::File(p) = source {
+        let pb = PathBuf::from(p);
+        if pb.exists() {
+            return Ok(Some(pb));
+        }
+    }
+    Ok(None)
 }
 
 /// Partial deserialization shape — used by `list()` to skip parsing the segments
@@ -147,6 +230,9 @@ pub fn delete(id: &str) -> Result<()> {
 }
 
 fn delete_from(dir: &Path, id: &str) -> Result<()> {
+    // Remove the sibling WAV best-effort — legacy records saved before playback
+    // support won't have one, and the operation must still succeed for them.
+    let _ = fs::remove_file(audio_path(dir, id));
     let path = record_path(dir, id);
     fs::remove_file(&path).with_context(|| format!("removing {}", path.display()))
 }
@@ -169,12 +255,15 @@ fn summarize(shape: ListShape) -> TranscriptSummary {
 }
 
 fn record_path(dir: &Path, id: &str) -> PathBuf {
-    // Guard against path traversal: ids must be plain filename stems.
-    let safe: String = id
-        .chars()
+    dir.join(format!("{}.json", sanitize_id(id)))
+}
+
+/// Keep only characters that are safe as a filename stem. Guards against path
+/// traversal (`../foo`) and non-portable chars; shared by record + audio paths.
+fn sanitize_id(id: &str) -> String {
+    id.chars()
         .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | 'T'))
-        .collect();
-    dir.join(format!("{safe}.json"))
+        .collect()
 }
 
 fn new_id_and_timestamp() -> (String, String) {
@@ -337,6 +426,7 @@ mod tests {
             TranscriptSource::Recording,
             Some(2.5),
             sample_result("hello", "en"),
+            None,
         )
         .unwrap();
 
@@ -366,6 +456,7 @@ mod tests {
             TranscriptSource::File("/path/to/audio.mp3".into()),
             None,
             sample_result("x", "en"),
+            None,
         )
         .unwrap();
         let loaded = load_from(&dir, &rec.id).unwrap();
@@ -460,6 +551,7 @@ mod tests {
             TranscriptSource::Recording,
             None,
             sample_result("bye", "en"),
+            None,
         )
         .unwrap();
         let path = record_path(&dir, &rec.id);
@@ -468,6 +560,171 @@ mod tests {
         assert!(!path.exists());
         // Second delete must fail — removing a missing file is an error.
         assert!(delete_from(&dir, &rec.id).is_err());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    fn tone_samples(duration_secs: f32, sample_rate: u32, channels: u16) -> Vec<f32> {
+        let frames = (duration_secs * sample_rate as f32) as usize;
+        let freq = 440.0_f32;
+        let mut out = Vec::with_capacity(frames * channels as usize);
+        for i in 0..frames {
+            let t = i as f32 / sample_rate as f32;
+            let s = (t * freq * std::f32::consts::TAU).sin() * 0.5;
+            for _ in 0..channels {
+                out.push(s);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn save_writes_wav_sibling_when_audio_present() {
+        let dir = tmp_dir("wav_save");
+        let samples = tone_samples(0.05, 16_000, 1);
+        let rec = save_in(
+            &dir,
+            "base.en".into(),
+            TranscriptSource::Recording,
+            Some(0.05),
+            sample_result("tone", "en"),
+            Some(SavedAudio {
+                samples,
+                sample_rate: 16_000,
+                channels: 1,
+            }),
+        )
+        .unwrap();
+
+        let wav = audio_path(&dir, &rec.id);
+        assert!(wav.exists(), "expected sibling wav at {}", wav.display());
+
+        // Spec should round-trip through hound's reader.
+        let reader = hound::WavReader::open(&wav).unwrap();
+        let spec = reader.spec();
+        assert_eq!(spec.sample_rate, 16_000);
+        assert_eq!(spec.channels, 1);
+        assert_eq!(spec.bits_per_sample, 16);
+
+        // No .wav.partial left behind on success.
+        let any_partial = fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .any(|e| e.path().extension().and_then(|s| s.to_str()) == Some("partial"));
+        assert!(!any_partial);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn save_omits_wav_when_audio_is_none() {
+        let dir = tmp_dir("wav_none");
+        let rec = save_in(
+            &dir,
+            "base.en".into(),
+            TranscriptSource::Recording,
+            None,
+            sample_result("no audio", "en"),
+            None,
+        )
+        .unwrap();
+        assert!(!audio_path(&dir, &rec.id).exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn delete_removes_wav_sibling_and_succeeds_when_absent() {
+        let dir = tmp_dir("wav_delete");
+        let rec = save_in(
+            &dir,
+            "base.en".into(),
+            TranscriptSource::Recording,
+            None,
+            sample_result("bye", "en"),
+            Some(SavedAudio {
+                samples: tone_samples(0.02, 16_000, 1),
+                sample_rate: 16_000,
+                channels: 1,
+            }),
+        )
+        .unwrap();
+        let wav = audio_path(&dir, &rec.id);
+        assert!(wav.exists());
+        delete_from(&dir, &rec.id).unwrap();
+        assert!(!wav.exists(), "wav sibling should be gone after delete");
+
+        // Legacy record without a wav — delete must still succeed.
+        let legacy = save_in(
+            &dir,
+            "base.en".into(),
+            TranscriptSource::Recording,
+            None,
+            sample_result("legacy", "en"),
+            None,
+        )
+        .unwrap();
+        delete_from(&dir, &legacy.id).unwrap();
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn audio_path_if_exists_prefers_sibling_wav() {
+        let dir = tmp_dir("lookup_wav");
+        let rec = save_in(
+            &dir,
+            "base.en".into(),
+            TranscriptSource::Recording,
+            None,
+            sample_result("t", "en"),
+            Some(SavedAudio {
+                samples: tone_samples(0.02, 16_000, 1),
+                sample_rate: 16_000,
+                channels: 1,
+            }),
+        )
+        .unwrap();
+        let got = audio_path_if_exists_in(&dir, &rec.id, &TranscriptSource::Recording)
+            .unwrap()
+            .unwrap();
+        assert_eq!(got, audio_path(&dir, &rec.id));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn audio_path_if_exists_falls_back_to_file_source() {
+        let dir = tmp_dir("lookup_file");
+        let src = std::env::temp_dir().join(format!("t-src-{}.mp3", std::process::id()));
+        fs::write(&src, b"fake mp3 bytes").unwrap();
+        let source = TranscriptSource::File(src.to_string_lossy().into_owned());
+        let rec = save_in(
+            &dir,
+            "base.en".into(),
+            source.clone(),
+            None,
+            sample_result("t", "en"),
+            None,
+        )
+        .unwrap();
+        let got = audio_path_if_exists_in(&dir, &rec.id, &source).unwrap().unwrap();
+        assert_eq!(got, src);
+        fs::remove_file(&src).ok();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn audio_path_if_exists_returns_none_when_file_source_missing() {
+        let dir = tmp_dir("lookup_missing");
+        let source = TranscriptSource::File("/nonexistent/path.mp3".into());
+        let rec = save_in(
+            &dir,
+            "base.en".into(),
+            source.clone(),
+            None,
+            sample_result("t", "en"),
+            None,
+        )
+        .unwrap();
+        assert!(audio_path_if_exists_in(&dir, &rec.id, &source).unwrap().is_none());
         let _ = fs::remove_dir_all(&dir);
     }
 

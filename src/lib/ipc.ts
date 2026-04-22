@@ -81,6 +81,8 @@ export const api = {
   listTranscripts: () => invoke<TranscriptSummary[]>("list_transcripts"),
   loadTranscript: (id: string) => invoke<TranscriptRecord>("load_transcript", { id }),
   deleteTranscript: (id: string) => invoke<void>("delete_transcript", { id }),
+  getTranscriptAudioPath: (id: string, source: TranscriptSource) =>
+    invoke<string | null>("get_transcript_audio_path", { id, source }),
 };
 
 const on = <T,>(name: string, cb: (payload: T) => void): Promise<UnlistenFn> =>

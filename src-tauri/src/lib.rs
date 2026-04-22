@@ -22,6 +22,7 @@ pub fn run() {
             commands::list_transcripts,
             commands::load_transcript,
             commands::delete_transcript,
+            commands::get_transcript_audio_path,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
