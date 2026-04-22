@@ -8,6 +8,8 @@
     api,
     events,
     type ModelEntry,
+    type ModelId,
+    type TranscriptRecord,
     type TranscriptResult,
     type TranscriptSource,
     type TranscriptSummary,
@@ -20,8 +22,10 @@
     | { kind: "downloading"; model: string; pct: number; stage: string }
     | { kind: "error"; message: string };
 
+  const PREVIEW_CHARS = 120;
+
   let models = $state<ModelEntry[]>([]);
-  let selectedModel = $state<string>("large-v3-turbo");
+  let selectedModel = $state<ModelId>("large-v3-turbo");
   let status = $state<Status>({ kind: "idle" });
   let elapsed = $state<number>(0);
   let level = $state<number>(0);
@@ -102,7 +106,7 @@
     models = await api.listModels();
   }
 
-  async function ensureModel(id: string) {
+  async function ensureModel(id: ModelId) {
     status = { kind: "downloading", model: id, pct: 0, stage: "ggml" };
     await api.downloadModel(id);
     await refreshModels();
@@ -120,7 +124,7 @@
       const duration = result.segments.at(-1)?.end ?? null;
       const saved = await api.saveTranscript(selectedModel, source, duration, result);
       currentId = saved.id;
-      history = await api.listTranscripts();
+      history = [toSummary(saved), ...history];
       status = { kind: "idle" };
     } catch (e) {
       status = { kind: "error", message: String(e) };
@@ -271,6 +275,23 @@
     return source.kind === "recording" ? "Recording" : basename(source.value);
   }
 
+  // Mirrors `transcripts::summarize` in Rust so the list can update without a re-scan.
+  function toSummary(rec: TranscriptRecord): TranscriptSummary {
+    const chars = [...rec.result.text];
+    const preview = chars.length > PREVIEW_CHARS
+      ? chars.slice(0, PREVIEW_CHARS).join("") + "…"
+      : chars.join("");
+    return {
+      id: rec.id,
+      created_at: rec.created_at,
+      model: rec.model,
+      source: rec.source,
+      duration_secs: rec.duration_secs,
+      language: rec.result.language,
+      preview,
+    };
+  }
+
   function fmtDuration(seconds: number): string {
     const s = Math.floor(seconds % 60).toString().padStart(2, "0");
     const m = Math.floor(seconds / 60).toString().padStart(2, "0");
@@ -416,7 +437,6 @@
 <style>
   :global(:root) {
     --bg: #f7f7f8;
-    --surface: #ffffffc0;
     --surface-solid: #ffffff;
     --border: rgba(0, 0, 0, 0.08);
     --text: #171719;
@@ -775,7 +795,6 @@
   @media (prefers-color-scheme: dark) {
     :global(:root) {
       --bg: #1a1a1c;
-      --surface: rgba(44, 44, 48, 0.7);
       --surface-solid: #2a2a2d;
       --border: rgba(255, 255, 255, 0.08);
       --text: #f1f1f3;

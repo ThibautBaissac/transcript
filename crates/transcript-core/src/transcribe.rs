@@ -166,7 +166,18 @@ impl Engine {
             sample_rate,
             channels,
         } = decode_file(path)?;
-        let prepared = to_whisper_input(&samples, sample_rate, channels)?;
+        self.transcribe_recorded(&samples, sample_rate, channels, opts)
+    }
+
+    /// Resample a captured interleaved buffer to Whisper's required format, then transcribe.
+    pub fn transcribe_recorded(
+        &self,
+        samples: &[f32],
+        sample_rate: u32,
+        channels: u16,
+        opts: &TranscribeOptions,
+    ) -> Result<TranscriptResult> {
+        let prepared = to_whisper_input(samples, sample_rate, channels)?;
         self.transcribe_samples(&prepared, opts)
     }
 }

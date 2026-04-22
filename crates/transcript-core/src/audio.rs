@@ -128,14 +128,12 @@ where
     }
 }
 
-// ────────────────────────── Live capture (cpal) ──────────────────────────
-
 /// Shared handle to an ongoing capture. The underlying cpal `Stream` is owned by a
-/// dedicated thread (because `Stream` is not `Send`). Dropping this handle, or calling
-/// `stop()`, halts capture and joins the thread.
+/// dedicated thread (because `Stream` is not `Send`). Dropping this handle halts
+/// capture and joins the thread; prefer `stop_and_take()` when you want the samples.
 pub struct CaptureHandle {
     stopper: Option<Stopper>,
-    pub buffer: Arc<Mutex<Vec<f32>>>,
+    pub(crate) buffer: Arc<Mutex<Vec<f32>>>,
     pub sample_rate: u32,
     pub channels: u16,
 }
@@ -146,11 +144,15 @@ struct Stopper {
 }
 
 impl CaptureHandle {
-    pub fn stop(mut self) {
+    /// Halts capture, joins the owner thread, and returns the accumulated samples.
+    /// Because `join()` waits for the owner thread to drop the cpal `Stream`, no
+    /// callback can fire after this returns — so the `mem::take` sees a stable buffer.
+    pub fn stop_and_take(mut self) -> Vec<f32> {
         if let Some(s) = self.stopper.take() {
             let _ = s.stop_tx.send(());
             let _ = s.thread.join();
         }
+        std::mem::take(&mut *self.buffer.lock())
     }
 }
 
@@ -163,15 +165,13 @@ impl Drop for CaptureHandle {
     }
 }
 
-/// Starts a live capture from the default input device. Audio accumulates in `buffer`
-/// (interleaved f32). `level_cb` receives the RMS amplitude of each delivered buffer
-/// in [0, 1] — use it to drive a VU meter.
+/// Starts a live capture from the default input device. Audio accumulates internally
+/// and is drained via `CaptureHandle::stop_and_take`. `level_cb` receives the RMS
+/// amplitude of each delivered buffer in [0, 1] — use it to drive a VU meter.
 pub fn start_capture<F>(level_cb: F) -> Result<CaptureHandle>
 where
     F: FnMut(f32) + Send + 'static,
 {
-    // Startup handshake: the audio thread probes the default device, builds the stream,
-    // and reports the negotiated format back so the caller knows sample rate/channels.
     let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<StreamReady>>();
     let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
 
@@ -179,9 +179,6 @@ where
         match build_stream(level_cb) {
             Ok((stream, ready)) => {
                 let _ = ready_tx.send(Ok(ready));
-                // Park on the stop signal while `stream` stays alive in this thread.
-                // When `stop_rx.recv()` unblocks (either Ok(()) or Err on sender drop),
-                // dropping `stream` halts cpal capture.
                 let _ = stop_rx.recv();
                 drop(stream);
             }
@@ -240,11 +237,14 @@ where
         }
         cpal::SampleFormat::I16 => {
             let buf = buffer.clone();
+            // Reused each callback to avoid heap churn on the audio thread.
+            let mut scratch = Vec::<f32>::with_capacity(8192);
             device.build_input_stream(
                 &config.clone().into(),
                 move |data: &[i16], _| {
-                    let samples: Vec<f32> = data.iter().map(|s| *s as f32 / 32768.0).collect();
-                    push_and_meter(&samples, &buf, &mut level_cb);
+                    scratch.clear();
+                    scratch.extend(data.iter().map(|s| *s as f32 / 32768.0));
+                    push_and_meter(&scratch, &buf, &mut level_cb);
                 },
                 err_fn,
                 None,
@@ -252,14 +252,13 @@ where
         }
         cpal::SampleFormat::U16 => {
             let buf = buffer.clone();
+            let mut scratch = Vec::<f32>::with_capacity(8192);
             device.build_input_stream(
                 &config.clone().into(),
                 move |data: &[u16], _| {
-                    let samples: Vec<f32> = data
-                        .iter()
-                        .map(|s| (*s as f32 - 32768.0) / 32768.0)
-                        .collect();
-                    push_and_meter(&samples, &buf, &mut level_cb);
+                    scratch.clear();
+                    scratch.extend(data.iter().map(|s| (*s as f32 - 32768.0) / 32768.0));
+                    push_and_meter(&scratch, &buf, &mut level_cb);
                 },
                 err_fn,
                 None,
@@ -367,10 +366,9 @@ pub fn record_until_silence(
         }
     }
 
-    let samples = std::mem::take(&mut *handle.buffer.lock());
+    let samples = handle.stop_and_take();
     let frames = samples.len() / channels.max(1);
     let duration_seconds = frames as f32 / sample_rate as f32;
-    drop(handle); // dropping stops the cpal stream
 
     on_event(RecordEvent::Stopped {
         reason: stop_reason,

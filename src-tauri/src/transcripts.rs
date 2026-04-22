@@ -54,18 +54,39 @@ pub fn save(
         duration_secs,
         result,
     };
-    // Atomic write: serialize to a sibling `.partial`, then rename. Same pattern as
-    // `models::download_to_file`. Prevents `list()` from ever seeing a half-written file.
+    // Atomic write: serialize to a sibling `.partial`, fsync, then rename. Same pattern
+    // as `models::download_to_file`. `sync_all` before rename ensures the content is
+    // durable on disk before the dir entry promotes it — otherwise a power loss between
+    // write and flush can leave a zero-length file that `list()` would silently skip.
     let final_path = record_path(&dir, &record.id);
     let tmp_path = final_path.with_extension("json.partial");
     {
-        let file = fs::File::create(&tmp_path)
+        let mut file = fs::File::create(&tmp_path)
             .with_context(|| format!("writing {}", tmp_path.display()))?;
-        serde_json::to_writer_pretty(file, &record).with_context(|| "serializing record")?;
+        serde_json::to_writer_pretty(&mut file, &record).with_context(|| "serializing record")?;
+        file.sync_all().with_context(|| "fsync record")?;
     }
     fs::rename(&tmp_path, &final_path)
         .with_context(|| format!("renaming into {}", final_path.display()))?;
     Ok(record)
+}
+
+/// Partial deserialization shape — used by `list()` to skip parsing the segments
+/// array, which dominates file size for long recordings.
+#[derive(Deserialize)]
+struct ListShape {
+    id: String,
+    created_at: String,
+    model: String,
+    source: TranscriptSource,
+    duration_secs: Option<f32>,
+    result: ResultHead,
+}
+
+#[derive(Deserialize)]
+struct ResultHead {
+    language: String,
+    text: String,
 }
 
 pub fn list() -> Result<Vec<TranscriptSummary>> {
@@ -88,9 +109,9 @@ pub fn list() -> Result<Vec<TranscriptSummary>> {
         }
         match fs::read_to_string(&path)
             .map_err(anyhow::Error::from)
-            .and_then(|s| serde_json::from_str::<TranscriptRecord>(&s).map_err(Into::into))
+            .and_then(|s| serde_json::from_str::<ListShape>(&s).map_err(Into::into))
         {
-            Ok(rec) => out.push(summarize(rec)),
+            Ok(shape) => out.push(summarize(shape)),
             Err(err) => eprintln!("transcripts: skipping {}: {err:#}", path.display()),
         }
     }
@@ -112,19 +133,19 @@ pub fn delete(id: &str) -> Result<()> {
     fs::remove_file(&path).with_context(|| format!("removing {}", path.display()))
 }
 
-fn summarize(rec: TranscriptRecord) -> TranscriptSummary {
-    let mut chars = rec.result.text.chars();
+fn summarize(shape: ListShape) -> TranscriptSummary {
+    let mut chars = shape.result.text.chars();
     let mut preview: String = chars.by_ref().take(PREVIEW_CHARS).collect();
     if chars.next().is_some() {
         preview.push('…');
     }
     TranscriptSummary {
-        id: rec.id,
-        created_at: rec.created_at,
-        model: rec.model,
-        source: rec.source,
-        duration_secs: rec.duration_secs,
-        language: rec.result.language,
+        id: shape.id,
+        created_at: shape.created_at,
+        model: shape.model,
+        source: shape.source,
+        duration_secs: shape.duration_secs,
+        language: shape.result.language,
         preview,
     }
 }

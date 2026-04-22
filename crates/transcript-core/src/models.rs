@@ -222,6 +222,7 @@ where
         progress_cb(downloaded, total);
     }
     file.flush().await?;
+    file.sync_all().await?;
     drop(file);
     tokio::fs::rename(&tmp, dest).await?;
     Ok(())

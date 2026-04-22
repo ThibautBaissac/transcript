@@ -132,11 +132,7 @@ pub fn stop_recording(state: State<'_, AppState>) -> Result<RecordingInfo, Strin
         .ok_or_else(|| "not recording".to_string())?;
     let sample_rate = handle.sample_rate;
     let channels = handle.channels;
-    let buffer_arc = handle.buffer.clone();
-    // Stop cpal first so the audio thread can't keep pushing into the buffer after we
-    // move the samples out.
-    handle.stop();
-    let samples = std::mem::take(&mut *buffer_arc.lock());
+    let samples = handle.stop_and_take();
     let frames = samples.len() / channels as usize;
     let duration_seconds = frames as f32 / sample_rate as f32;
     *state.last_recording.lock() = Some(StoredRecording {
@@ -171,10 +167,7 @@ pub async fn transcribe_current_recording(
     let engine_slot = state.engine.clone();
     run_blocking(move || {
         let engine = ensure_engine(&engine_slot, model)?;
-        let prepared =
-            transcript_core::resample::to_whisper_input(&rec.samples, rec.sample_rate, rec.channels)?;
-        drop(rec); // free the pre-resample buffer before inference allocates
-        engine.transcribe_samples(&prepared, &opts(lang))
+        engine.transcribe_recorded(&rec.samples, rec.sample_rate, rec.channels, &opts(lang))
     })
     .await
 }
@@ -202,9 +195,8 @@ fn opts(lang: Option<String>) -> TranscribeOptions {
     }
 }
 
-/// Loads `model` if the cached engine isn't already for it, then hands the engine back
-/// via a temporary held reference. Using a raw pointer out of the MutexGuard would be
-/// unsound, so callers get a `&Engine` bound to the guard's lifetime via a closure pattern.
+/// Returns a lifetime-bound handle to the cached engine, loading the requested model
+/// if the slot is empty or currently holds a different one.
 fn ensure_engine(
     slot: &Mutex<Option<Engine>>,
     model: ModelId,

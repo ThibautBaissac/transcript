@@ -6,7 +6,6 @@ use anyhow::{Context, Result, bail};
 use clap::{Parser, ValueEnum};
 use indicatif::{ProgressBar, ProgressStyle};
 use transcript_core::audio::{RecordEvent, StopReason, record_until_silence};
-use transcript_core::resample::to_whisper_input;
 use transcript_core::{
     DownloadStage, Engine, ModelId, TranscribeOptions, format_json, format_srt, format_txt,
     resolve_model,
@@ -101,7 +100,6 @@ async fn main() -> Result<()> {
     .with_context(|| "resolving model")?;
     bar.finish_and_clear();
 
-    // Engine load runs on a blocking thread pool.
     let engine = tokio::task::spawn_blocking(move || Engine::load(model))
         .await
         .context("engine thread panicked")??;
@@ -113,7 +111,6 @@ async fn main() -> Result<()> {
         initial_prompt: args.prompt,
     };
 
-    // Acquire audio either by recording or by decoding a file.
     let result = if args.record {
         eprintln!(
             "🎙  Recording (speak now — auto-stops after {:.1}s silence, max {:.0}s)…",
@@ -157,12 +154,12 @@ async fn main() -> Result<()> {
         .context("record thread panicked")??;
         eprintln!("transcribing…");
         tokio::task::spawn_blocking(move || {
-            let samples = to_whisper_input(
+            engine.transcribe_recorded(
                 &recorded.samples,
                 recorded.sample_rate,
                 recorded.channels,
-            )?;
-            engine.transcribe_samples(&samples, &opts)
+                &opts,
+            )
         })
         .await
         .context("transcription thread panicked")??

@@ -1,15 +1,22 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 
+export type ModelId =
+  | "base-en"
+  | "small-en"
+  | "medium-en"
+  | "large-v3"
+  | "large-v3-turbo";
+
 export type ModelEntry = {
-  id: string;
+  id: ModelId;
   display: string;
   ggml_present: boolean;
   coreml_present: boolean;
 };
 
 export type DownloadProgress = {
-  model: string;
+  model: ModelId;
   stage: "ggml" | "coreml";
   downloaded: number;
   total: number | null;
@@ -21,7 +28,6 @@ export type RecordingInfo = {
   duration_seconds: number;
   sample_rate: number;
   channels: number;
-  samples_len: number;
 };
 
 export type Segment = { start: number; end: number; text: string };
@@ -38,7 +44,7 @@ export type TranscriptSource =
 type TranscriptMeta = {
   id: string;
   created_at: string;
-  model: string;
+  model: ModelId;
   source: TranscriptSource;
   duration_secs: number | null;
 };
@@ -52,16 +58,16 @@ export type TranscriptSummary = TranscriptMeta & {
 
 export const api = {
   listModels: () => invoke<ModelEntry[]>("list_models"),
-  modelStatus: (id: string) => invoke<ModelEntry>("model_status", { id }),
-  downloadModel: (id: string) => invoke<ModelEntry>("download_model", { id }),
+  modelStatus: (id: ModelId) => invoke<ModelEntry>("model_status", { id }),
+  downloadModel: (id: ModelId) => invoke<ModelEntry>("download_model", { id }),
   startRecording: () => invoke<void>("start_recording"),
   stopRecording: () => invoke<RecordingInfo>("stop_recording"),
-  transcribeCurrent: (model: string, lang?: string) =>
+  transcribeCurrent: (model: ModelId, lang?: string) =>
     invoke<TranscriptResult>("transcribe_current_recording", { model, lang }),
-  transcribeFile: (path: string, model: string, lang?: string) =>
+  transcribeFile: (path: string, model: ModelId, lang?: string) =>
     invoke<TranscriptResult>("transcribe_file", { path, model, lang }),
   saveTranscript: (
-    model: string,
+    model: ModelId,
     source: TranscriptSource,
     durationSecs: number | null,
     result: TranscriptResult,
