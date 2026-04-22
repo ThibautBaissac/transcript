@@ -9,6 +9,8 @@
     events,
     type ModelEntry,
     type TranscriptResult,
+    type TranscriptSource,
+    type TranscriptSummary,
   } from "$lib/ipc";
 
   type Status =
@@ -28,6 +30,8 @@
   let droppedFile = $state<string | null>(null);
   let dragging = $state<boolean>(false);
   let copied = $state<boolean>(false);
+  let history = $state<TranscriptSummary[]>([]);
+  let currentId = $state<string | null>(null);
 
   const selectedEntry = $derived(
     models.find((m) => m.id === selectedModel) ?? null,
@@ -45,7 +49,17 @@
   let pendingListeners: Promise<UnlistenFn>[] = [];
 
   onMount(() => {
-    (async () => { models = await api.listModels(); })();
+    (async () => {
+      const [m, h] = await Promise.all([
+        api.listModels(),
+        api.listTranscripts().catch((e) => {
+          status = { kind: "error", message: `Couldn't load history: ${e}` };
+          return [] as TranscriptSummary[];
+        }),
+      ]);
+      models = m;
+      history = h;
+    })();
 
     const lvl = events.onLevel((l) => {
       level = Math.min(1, l.rms * 4);
@@ -94,12 +108,19 @@
     await refreshModels();
   }
 
-  async function runTranscribe(call: () => Promise<TranscriptResult>) {
+  async function runTranscribe(
+    call: () => Promise<TranscriptResult>,
+    source: TranscriptSource,
+  ) {
     status = { kind: "transcribing" };
     try {
       const result = await call();
       transcript = result;
       transcriptText = result.text;
+      const duration = result.segments.at(-1)?.end ?? null;
+      const saved = await api.saveTranscript(selectedModel, source, duration, result);
+      currentId = saved.id;
+      history = await api.listTranscripts();
       status = { kind: "idle" };
     } catch (e) {
       status = { kind: "error", message: String(e) };
@@ -143,7 +164,10 @@
       status = { kind: "error", message: String(e) };
       return;
     }
-    await runTranscribe(() => api.transcribeCurrent(selectedModel));
+    await runTranscribe(
+      () => api.transcribeCurrent(selectedModel),
+      { kind: "recording" },
+    );
   }
 
   async function transcribeDroppedFile(path: string) {
@@ -155,7 +179,10 @@
       status = { kind: "error", message: String(e) };
       return;
     }
-    await runTranscribe(() => api.transcribeFile(path, selectedModel));
+    await runTranscribe(
+      () => api.transcribeFile(path, selectedModel),
+      { kind: "file", value: path },
+    );
   }
 
   async function copyToClipboard() {
@@ -178,9 +205,70 @@
     else if (!busy && !needsDownload) startRecording();
   }
 
+  async function openTranscript(id: string) {
+    if (busy) return;
+    try {
+      const rec = await api.loadTranscript(id);
+      currentId = rec.id;
+      transcript = rec.result;
+      transcriptText = rec.result.text;
+      droppedFile = rec.source.kind === "file" ? rec.source.value : null;
+      status = { kind: "idle" };
+    } catch (e) {
+      status = { kind: "error", message: String(e) };
+    }
+  }
+
+  function closeTranscript() {
+    transcript = null;
+    transcriptText = "";
+    currentId = null;
+    droppedFile = null;
+  }
+
+  async function removeHistoryItem(id: string, event: MouseEvent) {
+    event.stopPropagation();
+    try {
+      await api.deleteTranscript(id);
+      history = await api.listTranscripts();
+      if (currentId === id) closeTranscript();
+    } catch (e) {
+      status = { kind: "error", message: String(e) };
+    }
+  }
+
   function basename(path: string): string {
     const i = Math.max(path.lastIndexOf("/"), path.lastIndexOf("\\"));
     return i >= 0 ? path.slice(i + 1) : path;
+  }
+
+  function formatRelative(iso: string): string {
+    const then = new Date(iso);
+    if (isNaN(then.getTime())) return iso;
+    const now = new Date();
+    const sameDay =
+      then.getFullYear() === now.getFullYear() &&
+      then.getMonth() === now.getMonth() &&
+      then.getDate() === now.getDate();
+    const time = then.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" });
+    if (sameDay) return `Today ${time}`;
+    const yesterday = new Date(now);
+    yesterday.setDate(now.getDate() - 1);
+    const isYesterday =
+      then.getFullYear() === yesterday.getFullYear() &&
+      then.getMonth() === yesterday.getMonth() &&
+      then.getDate() === yesterday.getDate();
+    if (isYesterday) return `Yesterday ${time}`;
+    const date = then.toLocaleDateString(undefined, {
+      month: "short",
+      day: "numeric",
+      year: then.getFullYear() === now.getFullYear() ? undefined : "numeric",
+    });
+    return `${date} · ${time}`;
+  }
+
+  function sourceLabel(source: TranscriptSource): string {
+    return source.kind === "recording" ? "Recording" : basename(source.value);
   }
 
   function fmtDuration(seconds: number): string {
@@ -254,10 +342,19 @@
     <p class="status-line" class:error={status.kind === "error"}>{statusLabel}</p>
   </section>
 
-  <section class="reader" class:empty={!transcript}>
+  <section
+    class="reader"
+    class:empty={!transcript && history.length === 0}
+    class:list={!transcript && history.length > 0}
+  >
     {#if transcript}
       <div class="reader-actions">
-        <button class="icon-btn" onclick={copyToClipboard} title="Copy">
+        {#if history.length > 0}
+          <button class="icon-btn" onclick={closeTranscript} title="Back to history">
+            <svg viewBox="0 0 24 24" width="16" height="16"><path d="M14 6l-6 6 6 6" stroke="currentColor" stroke-width="1.8" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          </button>
+        {/if}
+        <button class="icon-btn push-right" onclick={copyToClipboard} title="Copy">
           {#if copied}
             <svg viewBox="0 0 24 24" width="16" height="16"><path d="M5 12.5l4 4 10-10" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>
           {:else}
@@ -269,6 +366,35 @@
         </button>
       </div>
       <textarea class="reader-text" bind:value={transcriptText} spellcheck="false"></textarea>
+    {:else if history.length > 0}
+      <header class="list-header">
+        <h2>History</h2>
+        <span class="count">{history.length}</span>
+      </header>
+      <ul class="history-list">
+        {#each history as h (h.id)}
+          <li class="history-item">
+            <button class="history-row" onclick={() => openTranscript(h.id)}>
+              <div class="row-meta">
+                <span class="row-date">{formatRelative(h.created_at)}</span>
+                <span class="row-tags">
+                  <span class="tag">{sourceLabel(h.source)}</span>
+                  <span class="tag subtle">{h.language}</span>
+                </span>
+              </div>
+              <p class="row-preview">{h.preview || "(empty transcript)"}</p>
+            </button>
+            <button
+              class="row-delete"
+              title="Delete"
+              aria-label="Delete transcript"
+              onclick={(e) => removeHistoryItem(h.id, e)}
+            >
+              <svg viewBox="0 0 24 24" width="14" height="14"><path d="M6 6l12 12M18 6L6 18" stroke="currentColor" stroke-width="1.8" fill="none" stroke-linecap="round"/></svg>
+            </button>
+          </li>
+        {/each}
+      </ul>
     {:else}
       <div class="placeholder">
         <p>Press the button to record, or drop an audio file here.</p>
@@ -451,11 +577,13 @@
   .reader-actions {
     position: absolute;
     top: 10px;
+    left: 10px;
     right: 10px;
     display: flex;
     gap: 4px;
     z-index: 2;
   }
+  .reader-actions .push-right { margin-left: auto; }
   .icon-btn {
     width: 28px;
     height: 28px;
@@ -492,6 +620,118 @@
   }
   .placeholder p { margin: 0 0 4px; font-size: 13px; }
   .placeholder .faint { color: var(--text-faint); font-size: 12px; }
+
+  .reader.list { padding: 0; overflow: hidden; }
+  .list-header {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    padding: 14px 20px 10px;
+    border-bottom: 1px solid var(--border);
+  }
+  .list-header h2 {
+    margin: 0;
+    font-size: 13px;
+    font-weight: 600;
+    letter-spacing: 0.02em;
+    text-transform: uppercase;
+    color: var(--text-soft);
+  }
+  .list-header .count {
+    font-size: 12px;
+    color: var(--text-faint);
+    font-variant-numeric: tabular-nums;
+  }
+  .history-list {
+    list-style: none;
+    margin: 0;
+    padding: 4px 0;
+    max-height: calc(100vh - 280px);
+    overflow-y: auto;
+  }
+  .history-item {
+    position: relative;
+    border-bottom: 1px solid var(--border);
+  }
+  .history-item:last-child { border-bottom: none; }
+  .history-row {
+    width: 100%;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    padding: 12px 18px;
+    padding-right: 44px;
+    background: transparent;
+    border: none;
+    text-align: left;
+    cursor: pointer;
+    color: var(--text);
+    font: inherit;
+  }
+  .history-row:hover { background: var(--accent-soft); }
+  .history-row:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+  .row-meta {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+  }
+  .row-date {
+    font-size: 12px;
+    color: var(--text-soft);
+    font-variant-numeric: tabular-nums;
+  }
+  .row-tags { display: flex; gap: 4px; }
+  .tag {
+    font-size: 11px;
+    font-weight: 500;
+    padding: 2px 7px;
+    border-radius: 999px;
+    background: var(--accent-soft);
+    color: var(--accent);
+    max-width: 200px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .tag.subtle {
+    background: transparent;
+    color: var(--text-faint);
+    border: 1px solid var(--border);
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+  }
+  .row-preview {
+    margin: 0;
+    font-size: 13px;
+    line-height: 1.45;
+    color: var(--text);
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    line-clamp: 2;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+  }
+  .row-delete {
+    position: absolute;
+    top: 10px;
+    right: 10px;
+    width: 22px;
+    height: 22px;
+    border-radius: 6px;
+    display: grid;
+    place-items: center;
+    background: transparent;
+    border: none;
+    color: var(--text-faint);
+    opacity: 0;
+    transition: opacity 0.12s ease, background 0.12s ease, color 0.12s ease;
+    cursor: pointer;
+    padding: 0;
+  }
+  .history-item:hover .row-delete,
+  .row-delete:focus-visible { opacity: 1; }
+  .row-delete:hover { background: rgba(229, 75, 75, 0.14); color: var(--record); }
 
   .drop-overlay {
     position: fixed;

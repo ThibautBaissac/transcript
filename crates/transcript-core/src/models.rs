@@ -107,6 +107,13 @@ pub fn cache_dir() -> Result<PathBuf> {
     Ok(base.join(APP_DIR_NAME).join("models"))
 }
 
+/// Returns the directory where the GUI persists saved transcripts, sibling to `cache_dir()`.
+/// macOS: ~/Library/Application Support/com.thibautbaissac.transcript/transcripts
+pub fn transcripts_dir() -> Result<PathBuf> {
+    let base = dirs::data_dir().ok_or_else(|| anyhow!("could not resolve OS data directory"))?;
+    Ok(base.join(APP_DIR_NAME).join("transcripts"))
+}
+
 pub fn model_info(id: ModelId) -> Result<ModelInfo> {
     let dir = cache_dir()?;
     let ggml_path = dir.join(id.ggml_filename());

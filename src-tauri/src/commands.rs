@@ -11,6 +11,8 @@ use transcript_core::{
     Engine, ModelId, ModelInfo, TranscribeOptions, TranscriptResult, model_info, resolve_model,
 };
 
+use crate::transcripts::{self, TranscriptRecord, TranscriptSource, TranscriptSummary};
+
 const LEVEL_MIN_INTERVAL_MS: u64 = 33; // ~30 Hz — one canvas frame.
 
 #[derive(Default)]
@@ -216,12 +218,38 @@ fn ensure_engine(
     }))
 }
 
-async fn run_blocking<F>(f: F) -> Result<TranscriptResult, String>
+async fn run_blocking<T, F>(f: F) -> Result<T, String>
 where
-    F: FnOnce() -> anyhow::Result<TranscriptResult> + Send + 'static,
+    T: Send + 'static,
+    F: FnOnce() -> anyhow::Result<T> + Send + 'static,
 {
     tokio::task::spawn_blocking(f)
         .await
         .map_err(|e| e.to_string())?
         .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn save_transcript(
+    model: String,
+    source: TranscriptSource,
+    duration_secs: Option<f32>,
+    result: TranscriptResult,
+) -> Result<TranscriptRecord, String> {
+    run_blocking(move || transcripts::save(model, source, duration_secs, result)).await
+}
+
+#[tauri::command]
+pub async fn list_transcripts() -> Result<Vec<TranscriptSummary>, String> {
+    run_blocking(transcripts::list).await
+}
+
+#[tauri::command]
+pub async fn load_transcript(id: String) -> Result<TranscriptRecord, String> {
+    run_blocking(move || transcripts::load(&id)).await
+}
+
+#[tauri::command]
+pub async fn delete_transcript(id: String) -> Result<(), String> {
+    run_blocking(move || transcripts::delete(&id)).await
 }
