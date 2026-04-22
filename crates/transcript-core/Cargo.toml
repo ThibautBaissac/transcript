@@ -1,0 +1,39 @@
+[package]
+name = "transcript-core"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Shared core for local Whisper transcription (audio capture, decoding, resampling, inference)."
+
+[dependencies]
+anyhow.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+# Whisper inference via whisper.cpp bindings, with CoreML (ANE) acceleration on macOS.
+whisper-rs = { version = "0.14", features = ["coreml"] }
+
+# Microphone capture (CoreAudio on macOS).
+cpal = "0.15"
+
+# Audio file decoding (wav, mp3, m4a/aac, flac, opus/webm, ogg).
+symphonia = { version = "0.5", features = ["all-codecs", "all-formats"] }
+
+# High-quality resampling to whisper's required 16 kHz mono.
+rubato = "0.15"
+
+# Streaming HTTP model downloads.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
+tokio = { version = "1", features = ["rt", "macros", "fs", "io-util"] }
+futures-util = "0.3"
+
+# Known OS cache directories (for model storage).
+dirs = "5"
+
+# Locking/concurrency primitives.
+parking_lot = "0.12"
+
+[dev-dependencies]
+hound = "3"

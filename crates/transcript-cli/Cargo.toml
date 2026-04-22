@@ -1,0 +1,19 @@
+[package]
+name = "transcript-cli"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Command-line transcription for local Whisper (shares core with the GUI)."
+
+[[bin]]
+name = "transcript"
+path = "src/main.rs"
+
+[dependencies]
+transcript-core = { path = "../transcript-core" }
+anyhow.workspace = true
+serde_json.workspace = true
+clap = { version = "4", features = ["derive"] }
+indicatif = "0.17"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
