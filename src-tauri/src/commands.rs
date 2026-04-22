@@ -8,7 +8,8 @@ use serde::Serialize;
 use tauri::{AppHandle, Emitter, State};
 use transcript_core::audio::{CaptureHandle, start_capture};
 use transcript_core::{
-    Engine, ModelId, ModelInfo, TranscribeOptions, TranscriptResult, model_info, resolve_model,
+    Engine, ModelId, ModelInfo, TranscribeOptions, TranscriptResult, format_srt, format_txt,
+    model_info, resolve_model,
 };
 
 use crate::transcripts::{self, TranscriptRecord, TranscriptSource, TranscriptSummary};
@@ -192,6 +193,15 @@ pub async fn transcribe_file(
     .await
 }
 
+#[tauri::command]
+pub fn format_transcript(format: String, result: TranscriptResult) -> Result<String, String> {
+    match format.as_str() {
+        "txt" => Ok(format_txt(&result)),
+        "srt" => Ok(format_srt(&result)),
+        _ => Err(format!("unknown format: {format}")),
+    }
+}
+
 fn opts(lang: Option<String>) -> TranscribeOptions {
     TranscribeOptions {
         language: lang,
@@ -371,6 +381,28 @@ mod tests {
         assert!(json.contains("duration_seconds"));
         assert!(json.contains("sample_rate"));
         assert!(json.contains("channels"));
+    }
+
+    #[test]
+    fn format_transcript_dispatches_by_name() {
+        use transcript_core::Segment;
+        let result = TranscriptResult {
+            text: "hello world".into(),
+            segments: vec![Segment { start: 0.0, end: 1.5, text: "hello".into() }],
+            language: "en".into(),
+        };
+
+        assert_eq!(
+            format_transcript("txt".into(), result.clone()).unwrap(),
+            "hello world"
+        );
+
+        let srt = format_transcript("srt".into(), result.clone()).unwrap();
+        assert!(srt.contains(" --> "), "srt: {srt}");
+        assert!(srt.contains("hello"), "srt: {srt}");
+
+        let err = format_transcript("xml".into(), result).unwrap_err();
+        assert!(err.contains("xml"), "err: {err}");
     }
 
     #[tokio::test]

@@ -66,6 +66,8 @@ export const api = {
     invoke<TranscriptResult>("transcribe_current_recording", { model, lang }),
   transcribeFile: (path: string, model: ModelId, lang?: string) =>
     invoke<TranscriptResult>("transcribe_file", { path, model, lang }),
+  formatTranscript: (format: "txt" | "srt", result: TranscriptResult) =>
+    invoke<string>("format_transcript", { format, result }),
   saveTranscript: (
     model: ModelId,
     source: TranscriptSource,

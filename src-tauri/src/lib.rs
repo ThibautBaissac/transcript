@@ -18,6 +18,7 @@ pub fn run() {
             commands::stop_recording,
             commands::transcribe_current_recording,
             commands::transcribe_file,
+            commands::format_transcript,
             commands::save_transcript,
             commands::list_transcripts,
             commands::load_transcript,

@@ -245,12 +245,20 @@
   }
 
   async function saveTranscriptToFile() {
+    if (!transcript) return;
+    const ts = new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-");
     const path = await save({
-      defaultPath: `transcript-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-")}.txt`,
-      filters: [{ name: "Text", extensions: ["txt"] }],
+      defaultPath: `transcript-${ts}.txt`,
+      filters: [
+        { name: "Text", extensions: ["txt"] },
+        { name: "SubRip Subtitle", extensions: ["srt"] },
+      ],
     });
     if (!path) return;
-    await writeTextFile(path, joinedText);
+    const ext = path.split(".").pop()?.toLowerCase();
+    const format = ext === "srt" ? "srt" : "txt";
+    const body = await api.formatTranscript(format, transcript);
+    await writeTextFile(path, body);
   }
 
   async function loadAudioFor(id: string, source: TranscriptSource) {
@@ -498,7 +506,7 @@
             <svg viewBox="0 0 24 24" width="16" height="16"><rect x="8" y="8" width="12" height="12" rx="2" stroke="currentColor" stroke-width="1.7" fill="none"/><rect x="4" y="4" width="12" height="12" rx="2" stroke="currentColor" stroke-width="1.7" fill="none"/></svg>
           {/if}
         </button>
-        <button class="icon-btn" onclick={saveTranscriptToFile} title="Save .txt">
+        <button class="icon-btn" onclick={saveTranscriptToFile} title="Save transcript">
           <svg viewBox="0 0 24 24" width="16" height="16"><path d="M12 3v12m0 0l-4-4m4 4l4-4M5 21h14" stroke="currentColor" stroke-width="1.7" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>
         </button>
       </div>
