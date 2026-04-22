@@ -27,7 +27,7 @@
   let transcriptText = $state<string>("");
   let droppedFile = $state<string | null>(null);
   let dragging = $state<boolean>(false);
-  let vuCanvas: HTMLCanvasElement | undefined = $state();
+  let copied = $state<boolean>(false);
 
   const selectedEntry = $derived(
     models.find((m) => m.id === selectedModel) ?? null,
@@ -42,18 +42,13 @@
   );
 
   let timerId: number | undefined;
-  let rafId: number | undefined;
-  let vuDirty = false;
   let pendingListeners: Promise<UnlistenFn>[] = [];
 
   onMount(() => {
     (async () => { models = await api.listModels(); })();
 
-    // Stash the pending listener promises so onDestroy can await them — avoids
-    // leaking a listener if the component unmounts before `listen()` resolves.
     const lvl = events.onLevel((l) => {
-      level = Math.min(1, l.rms * 4); // gentle amplification for visibility
-      vuDirty = true;
+      level = Math.min(1, l.rms * 4);
     });
     const dl = events.onDownloadProgress((p) => {
       if (status.kind !== "downloading") return;
@@ -80,40 +75,14 @@
       }
     });
     pendingListeners = [lvl, dl, drop];
-
-    // rAF-driven canvas redraw: decouples drawing from IPC frequency, and naturally
-    // caps at display refresh rate regardless of how fast level events arrive.
-    const tick = () => {
-      if (vuDirty) {
-        drawVu();
-        vuDirty = false;
-      }
-      rafId = requestAnimationFrame(tick);
-    };
-    rafId = requestAnimationFrame(tick);
   });
 
   onDestroy(async () => {
     if (timerId) clearInterval(timerId);
-    if (rafId) cancelAnimationFrame(rafId);
     for (const p of pendingListeners) {
       try { (await p)(); } catch {}
     }
   });
-
-  function drawVu() {
-    const c = vuCanvas;
-    if (!c) return;
-    const ctx = c.getContext("2d");
-    if (!ctx) return;
-    const w = c.width;
-    const h = c.height;
-    ctx.clearRect(0, 0, w, h);
-    const barW = w * level;
-    const hue = level > 0.8 ? 0 : 120 - level * 50;
-    ctx.fillStyle = `hsl(${hue}, 70%, 50%)`;
-    ctx.fillRect(0, 0, barW, h);
-  }
 
   async function refreshModels() {
     models = await api.listModels();
@@ -155,24 +124,10 @@
         if (status.kind === "recording") {
           elapsed = (performance.now() - status.startedAt) / 1000;
         }
-      }, 1000);
+      }, 250);
     } catch (e) {
       status = { kind: "error", message: String(e) };
     }
-  }
-
-  async function transcribeDroppedFile(path: string) {
-    if (busy) return;
-    droppedFile = path;
-    try {
-      // Auto-fetch the model on drop — a drop is an explicit transcribe intent,
-      // so block on download rather than forcing the user to notice a disabled button.
-      if (needsDownload) await ensureModel(selectedModel);
-    } catch (e) {
-      status = { kind: "error", message: String(e) };
-      return;
-    }
-    await runTranscribe(() => api.transcribeFile(path, selectedModel));
   }
 
   async function stopAndTranscribe() {
@@ -191,8 +146,22 @@
     await runTranscribe(() => api.transcribeCurrent(selectedModel));
   }
 
+  async function transcribeDroppedFile(path: string) {
+    if (busy) return;
+    droppedFile = path;
+    try {
+      if (needsDownload) await ensureModel(selectedModel);
+    } catch (e) {
+      status = { kind: "error", message: String(e) };
+      return;
+    }
+    await runTranscribe(() => api.transcribeFile(path, selectedModel));
+  }
+
   async function copyToClipboard() {
     await navigator.clipboard.writeText(transcriptText);
+    copied = true;
+    setTimeout(() => (copied = false), 1400);
   }
 
   async function saveTranscript() {
@@ -204,332 +173,385 @@
     await writeTextFile(path, transcriptText);
   }
 
+  function handleMainClick() {
+    if (status.kind === "recording") stopAndTranscribe();
+    else if (!busy && !needsDownload) startRecording();
+  }
+
   function basename(path: string): string {
     const i = Math.max(path.lastIndexOf("/"), path.lastIndexOf("\\"));
     return i >= 0 ? path.slice(i + 1) : path;
   }
 
   function fmtDuration(seconds: number): string {
-    const s = Math.floor(seconds % 60)
-      .toString()
-      .padStart(2, "0");
-    const m = Math.floor(seconds / 60)
-      .toString()
-      .padStart(2, "0");
+    const s = Math.floor(seconds % 60).toString().padStart(2, "0");
+    const m = Math.floor(seconds / 60).toString().padStart(2, "0");
     return `${m}:${s}`;
   }
+
+  const statusLabel = $derived.by(() => {
+    switch (status.kind) {
+      case "recording": return fmtDuration(elapsed);
+      case "transcribing":
+        return droppedFile ? `Transcribing ${basename(droppedFile)}…` : "Transcribing…";
+      case "downloading":
+        return `Downloading ${status.stage} · ${status.pct}%`;
+      case "error": return status.message;
+      case "idle":
+        if (needsDownload) return "Model not downloaded";
+        if (transcript) return `${transcript.language} · ${transcript.segments.length} segments`;
+        return "Tap to record · or drop an audio file";
+    }
+  });
 </script>
 
-<main>
-  <header class="top-bar">
-    <h1>Transcript</h1>
-    <div class="model-picker">
-      <label for="model">Model</label>
+<div class="titlebar" data-tauri-drag-region></div>
+
+<main class:has-transcript={!!transcript}>
+  <header class="top">
+    <div class="brand">Transcript</div>
+    <div class="model-pill" class:warn={needsDownload}>
+      <label for="model" class="sr-only">Model</label>
       <select id="model" bind:value={selectedModel} disabled={busy}>
         {#each models as m}
-          <option value={m.id}>
-            {m.display} {m.ggml_present ? "✓" : "(not downloaded)"}
-          </option>
+          <option value={m.id}>{m.display}</option>
         {/each}
       </select>
       {#if needsDownload && status.kind !== "downloading"}
-        <button class="secondary" onclick={downloadSelected}>Download</button>
+        <button class="pill-action" onclick={downloadSelected}>Download</button>
       {/if}
     </div>
   </header>
 
-  <section class="record-panel">
-    <canvas
-      bind:this={vuCanvas}
-      class="vu-meter"
-      width="600"
-      height="16"
-      aria-label="Input level"
-    ></canvas>
+  <section class="stage">
+    <button
+      class="record"
+      class:recording={status.kind === "recording"}
+      class:disabled={needsDownload || (busy && status.kind !== "recording")}
+      onclick={handleMainClick}
+      disabled={needsDownload || (busy && status.kind !== "recording")}
+      style="--glow: {Math.min(1, level * 1.2)}"
+      aria-label={status.kind === "recording" ? "Stop and transcribe" : "Start recording"}
+    >
+      <span class="glow" aria-hidden="true"></span>
+      <span class="icon" aria-hidden="true">
+        {#if status.kind === "recording"}
+          <svg viewBox="0 0 24 24" width="26" height="26">
+            <rect x="6" y="6" width="12" height="12" rx="2" fill="currentColor"/>
+          </svg>
+        {:else if status.kind === "transcribing" || status.kind === "downloading"}
+          <svg viewBox="0 0 24 24" width="26" height="26" class="spin">
+            <circle cx="12" cy="12" r="9" stroke="currentColor" stroke-width="2.5" fill="none" stroke-linecap="round" stroke-dasharray="42 100"/>
+          </svg>
+        {:else}
+          <svg viewBox="0 0 24 24" width="26" height="26">
+            <path d="M12 3.5a3.5 3.5 0 0 0-3.5 3.5v5a3.5 3.5 0 0 0 7 0V7A3.5 3.5 0 0 0 12 3.5Zm7 8.5a.75.75 0 0 1 1.5 0 8.5 8.5 0 0 1-7.75 8.47V22a.75.75 0 0 1-1.5 0v-1.53A8.5 8.5 0 0 1 3.5 12a.75.75 0 0 1 1.5 0 7 7 0 1 0 14 0Z" fill="currentColor"/>
+          </svg>
+        {/if}
+      </span>
+    </button>
 
-    <div class="controls">
-      {#if status.kind === "recording"}
-        <button class="big stop" onclick={stopAndTranscribe}>
-          <span class="dot"></span> Stop &amp; Transcribe
-        </button>
-      {:else if status.kind === "transcribing"}
-        <button class="big" disabled>Transcribing…</button>
-      {:else if status.kind === "downloading"}
-        <button class="big" disabled>
-          Downloading {status.stage} {status.pct}%
-        </button>
-      {:else}
-        <button
-          class="big record"
-          onclick={startRecording}
-          disabled={needsDownload}
-          title={needsDownload ? "Download the model first" : "Start recording"}
-        >
-          <span class="dot"></span> Record
-        </button>
-      {/if}
-      <span class="elapsed">{fmtDuration(elapsed)}</span>
-    </div>
-
-    <p class="hint">
-      {#if status.kind === "transcribing" && droppedFile}
-        Transcribing <code>{basename(droppedFile)}</code>…
-      {:else}
-        or drop an audio file anywhere in the window
-      {/if}
-    </p>
-
-    {#if status.kind === "error"}
-      <div class="error">{status.message}</div>
-    {/if}
+    <p class="status-line" class:error={status.kind === "error"}>{statusLabel}</p>
   </section>
 
-  {#if dragging}
-    <div class="drop-overlay" aria-hidden="true">
-      <div class="drop-card">Drop audio to transcribe</div>
-    </div>
-  {/if}
-
-  <section class="transcript-panel">
-    <div class="panel-header">
-      <h2>Transcript</h2>
-      <div class="panel-actions">
-        <button class="secondary" disabled={!transcript} onclick={copyToClipboard}>Copy</button>
-        <button class="secondary" disabled={!transcript} onclick={saveTranscript}>Save .txt</button>
-      </div>
-    </div>
-    <textarea
-      class="transcript-text"
-      bind:value={transcriptText}
-      placeholder={transcript
-        ? ""
-        : "Press Record to capture audio, then Stop & Transcribe. The text will appear here."}
-      spellcheck="false"
-    ></textarea>
+  <section class="reader" class:empty={!transcript}>
     {#if transcript}
-      <div class="meta">
-        Language: {transcript.language} · {transcript.segments.length} segments
+      <div class="reader-actions">
+        <button class="icon-btn" onclick={copyToClipboard} title="Copy">
+          {#if copied}
+            <svg viewBox="0 0 24 24" width="16" height="16"><path d="M5 12.5l4 4 10-10" stroke="currentColor" stroke-width="2" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          {:else}
+            <svg viewBox="0 0 24 24" width="16" height="16"><rect x="8" y="8" width="12" height="12" rx="2" stroke="currentColor" stroke-width="1.7" fill="none"/><rect x="4" y="4" width="12" height="12" rx="2" stroke="currentColor" stroke-width="1.7" fill="none"/></svg>
+          {/if}
+        </button>
+        <button class="icon-btn" onclick={saveTranscript} title="Save .txt">
+          <svg viewBox="0 0 24 24" width="16" height="16"><path d="M12 3v12m0 0l-4-4m4 4l4-4M5 21h14" stroke="currentColor" stroke-width="1.7" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        </button>
+      </div>
+      <textarea class="reader-text" bind:value={transcriptText} spellcheck="false"></textarea>
+    {:else}
+      <div class="placeholder">
+        <p>Press the button to record, or drop an audio file here.</p>
+        <p class="faint">Supports wav, mp3, m4a, flac, opus, webm, ogg.</p>
       </div>
     {/if}
   </section>
 </main>
 
+{#if dragging}
+  <div class="drop-overlay" aria-hidden="true">
+    <div class="drop-card">
+      <svg viewBox="0 0 24 24" width="20" height="20"><path d="M12 3v12m0 0l-4-4m4 4l4-4M5 21h14" stroke="currentColor" stroke-width="1.8" fill="none" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      <span>Drop audio to transcribe</span>
+    </div>
+  </div>
+{/if}
+
 <style>
   :global(:root) {
-    font-family: -apple-system, BlinkMacSystemFont, "Inter", "Helvetica Neue", sans-serif;
-    font-size: 15px;
-    color: #1a1a1a;
-    background: #f6f6f6;
+    --bg: #f7f7f8;
+    --surface: #ffffffc0;
+    --surface-solid: #ffffff;
+    --border: rgba(0, 0, 0, 0.08);
+    --text: #171719;
+    --text-soft: #6c6c72;
+    --text-faint: #a0a0a6;
+    --accent: #4a63e7;
+    --accent-soft: rgba(74, 99, 231, 0.12);
+    --record: #e54b4b;
+    --record-soft: rgba(229, 75, 75, 0.15);
+    --danger: #c0392b;
+    --radius: 14px;
+    --radius-sm: 8px;
+    font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Inter", sans-serif;
+    font-size: 14px;
+    color: var(--text);
+    background: var(--bg);
+    -webkit-font-smoothing: antialiased;
   }
-  :global(body) {
-    margin: 0;
+  :global(body) { margin: 0; }
+  :global(*) { box-sizing: border-box; }
+
+  .titlebar {
+    position: fixed;
+    top: 0; left: 0; right: 0;
+    height: 28px;
+    z-index: 10;
+    -webkit-app-region: drag;
   }
+
   main {
-    display: flex;
-    flex-direction: column;
+    display: grid;
+    grid-template-rows: auto auto 1fr;
     gap: 18px;
-    padding: 18px 24px;
+    padding: 40px 28px 24px;
     min-height: 100vh;
-    box-sizing: border-box;
   }
-  .top-bar {
+
+  .top {
     display: flex;
     align-items: center;
     justify-content: space-between;
-  }
-  .top-bar h1 {
-    margin: 0;
-    font-size: 20px;
-    font-weight: 600;
-  }
-  .model-picker {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-  }
-  .model-picker label {
-    color: #555;
-  }
-  select {
-    padding: 6px 8px;
-    border-radius: 6px;
-    border: 1px solid #cfcfcf;
-    background: #fff;
-    font-size: 14px;
-    min-width: 280px;
-  }
-  .record-panel {
-    display: flex;
-    flex-direction: column;
     gap: 12px;
-    align-items: center;
-    padding: 20px;
-    border-radius: 12px;
-    background: #fff;
-    border: 1px solid #e5e5e5;
   }
-  .vu-meter {
-    width: 100%;
-    max-width: 600px;
-    height: 16px;
-    background: #eee;
-    border-radius: 8px;
-  }
-  .controls {
-    display: flex;
-    align-items: center;
-    gap: 16px;
-  }
-  .big {
-    padding: 12px 24px;
-    font-size: 16px;
+  .brand {
+    font-size: 15px;
     font-weight: 600;
-    border: none;
-    border-radius: 10px;
-    background: #2952e3;
-    color: #fff;
-    cursor: pointer;
+    letter-spacing: -0.01em;
+    color: var(--text);
+  }
+  .model-pill {
     display: inline-flex;
     align-items: center;
-    gap: 8px;
+    gap: 2px;
+    background: var(--surface-solid);
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    padding: 2px;
+    box-shadow: 0 1px 2px rgba(0, 0, 0, 0.03);
   }
-  .big:disabled {
-    opacity: 0.6;
-    cursor: not-allowed;
+  .model-pill.warn { border-color: rgba(229, 165, 0, 0.4); }
+  .model-pill select {
+    appearance: none;
+    -webkit-appearance: none;
+    border: none;
+    background: transparent;
+    padding: 6px 26px 6px 12px;
+    font: inherit;
+    color: var(--text);
+    cursor: pointer;
+    border-radius: 999px;
+    background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 12'><path d='M3 5l3 3 3-3' stroke='%236c6c72' stroke-width='1.5' fill='none' stroke-linecap='round' stroke-linejoin='round'/></svg>");
+    background-repeat: no-repeat;
+    background-position: right 8px center;
   }
-  .big.record {
-    background: #2952e3;
-  }
-  .big.stop {
-    background: #c8322b;
-  }
-  .big .dot {
-    width: 10px;
-    height: 10px;
-    border-radius: 50%;
-    background: #fff;
-    display: inline-block;
-  }
-  .elapsed {
-    font-variant-numeric: tabular-nums;
-    color: #333;
-    min-width: 52px;
-  }
-  .hint {
-    margin: 0;
-    color: #777;
-    font-size: 13px;
-  }
-  .hint code {
-    font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
-    font-size: 12px;
-    background: rgba(0, 0, 0, 0.05);
-    padding: 1px 6px;
-    border-radius: 4px;
-  }
-  .error {
-    color: #b00020;
-    font-size: 13px;
-  }
-  .drop-overlay {
-    position: fixed;
-    inset: 0;
-    background: rgba(41, 82, 227, 0.08);
-    border: 3px dashed #2952e3;
-    border-radius: 12px;
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    pointer-events: none;
-    z-index: 50;
-  }
-  .drop-card {
-    background: #2952e3;
+  .model-pill select:disabled { color: var(--text-faint); cursor: not-allowed; }
+  .pill-action {
+    border: none;
+    background: var(--accent);
     color: #fff;
-    font-size: 18px;
-    font-weight: 600;
-    padding: 18px 28px;
-    border-radius: 12px;
-    box-shadow: 0 8px 30px rgba(0, 0, 0, 0.2);
-  }
-  .transcript-panel {
-    display: flex;
-    flex-direction: column;
-    gap: 8px;
-    flex: 1;
-  }
-  .panel-header {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-  }
-  .panel-header h2 {
-    margin: 0;
-    font-size: 16px;
-    font-weight: 600;
-  }
-  .panel-actions {
-    display: flex;
-    gap: 8px;
-  }
-  .secondary {
     padding: 6px 12px;
-    border: 1px solid #cfcfcf;
-    background: #fff;
-    border-radius: 6px;
-    font-size: 13px;
+    border-radius: 999px;
+    font: inherit;
+    font-weight: 500;
     cursor: pointer;
   }
-  .secondary:hover:not(:disabled) {
-    background: #f0f0f0;
+  .pill-action:hover { filter: brightness(1.05); }
+
+  .stage {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 14px;
+    padding: 6px 0 2px;
   }
-  .secondary:disabled {
-    opacity: 0.5;
-    cursor: not-allowed;
+
+  .record {
+    position: relative;
+    width: 88px;
+    height: 88px;
+    border-radius: 50%;
+    border: 1px solid var(--border);
+    background: var(--surface-solid);
+    color: var(--accent);
+    cursor: pointer;
+    display: grid;
+    place-items: center;
+    transition: transform 0.18s ease, box-shadow 0.18s ease, color 0.18s ease;
+    box-shadow: 0 1px 2px rgba(0, 0, 0, 0.04), 0 8px 24px rgba(0, 0, 0, 0.04);
   }
-  .transcript-text {
+  .record:hover:not(:disabled) { transform: translateY(-1px); }
+  .record:active:not(:disabled) { transform: translateY(0); }
+  .record.recording {
+    color: #fff;
+    background: var(--record);
+    border-color: transparent;
+    box-shadow:
+      0 0 0 calc(4px + 14px * var(--glow, 0)) var(--record-soft),
+      0 8px 28px rgba(229, 75, 75, 0.35);
+  }
+  .record.disabled { opacity: 0.45; cursor: not-allowed; }
+  .record .glow {
+    position: absolute;
+    inset: -10px;
+    border-radius: 50%;
+    pointer-events: none;
+    background: radial-gradient(closest-side, var(--record-soft), transparent 70%);
+    opacity: calc(0.25 + 0.6 * var(--glow, 0));
+    transition: opacity 0.08s linear;
+  }
+  .record:not(.recording) .glow { display: none; }
+  .record .icon { display: inline-flex; transition: transform 0.25s ease; }
+  .record:not(:disabled):active .icon { transform: scale(0.92); }
+
+  .spin { animation: spin 1.1s linear infinite; transform-origin: center; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  .status-line {
+    margin: 0;
+    color: var(--text-soft);
+    font-size: 13px;
+    font-variant-numeric: tabular-nums;
+    text-align: center;
+    min-height: 18px;
+  }
+  .status-line.error { color: var(--danger); }
+
+  .reader {
+    position: relative;
+    background: var(--surface-solid);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    min-height: 220px;
+    display: flex;
+    flex-direction: column;
+  }
+  .reader.empty { background: transparent; border-style: dashed; }
+
+  .reader-actions {
+    position: absolute;
+    top: 10px;
+    right: 10px;
+    display: flex;
+    gap: 4px;
+    z-index: 2;
+  }
+  .icon-btn {
+    width: 28px;
+    height: 28px;
+    border-radius: 8px;
+    border: 1px solid transparent;
+    background: transparent;
+    color: var(--text-soft);
+    display: grid;
+    place-items: center;
+    cursor: pointer;
+    transition: background 0.12s ease, color 0.12s ease;
+  }
+  .icon-btn:hover { background: var(--accent-soft); color: var(--accent); }
+
+  .reader-text {
     flex: 1;
-    min-height: 260px;
-    padding: 14px;
-    border-radius: 10px;
-    border: 1px solid #e5e5e5;
-    background: #fff;
-    font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
-    font-size: 14px;
-    line-height: 1.55;
+    width: 100%;
+    padding: 26px 28px;
+    border: none;
+    background: transparent;
+    font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "New York", Georgia, serif;
+    font-size: 15px;
+    line-height: 1.65;
+    color: var(--text);
     resize: none;
-    color: inherit;
+    outline: none;
   }
-  .meta {
-    color: #666;
-    font-size: 12px;
+
+  .placeholder {
+    margin: auto;
+    text-align: center;
+    padding: 32px;
+    color: var(--text-faint);
   }
+  .placeholder p { margin: 0 0 4px; font-size: 13px; }
+  .placeholder .faint { color: var(--text-faint); font-size: 12px; }
+
+  .drop-overlay {
+    position: fixed;
+    inset: 16px;
+    border: 2px dashed var(--accent);
+    border-radius: 18px;
+    background: var(--accent-soft);
+    display: grid;
+    place-items: center;
+    pointer-events: none;
+    z-index: 50;
+    animation: drop-in 0.15s ease-out;
+  }
+  .drop-card {
+    background: var(--accent);
+    color: #fff;
+    font-size: 14px;
+    font-weight: 500;
+    padding: 12px 18px;
+    border-radius: 999px;
+    display: inline-flex;
+    align-items: center;
+    gap: 10px;
+    box-shadow: 0 10px 30px rgba(0, 0, 0, 0.18);
+  }
+  @keyframes drop-in {
+    from { opacity: 0; }
+    to { opacity: 1; }
+  }
+
+  .sr-only {
+    position: absolute;
+    width: 1px; height: 1px;
+    padding: 0; margin: -1px;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+    white-space: nowrap;
+    border: 0;
+  }
+
   @media (prefers-color-scheme: dark) {
     :global(:root) {
-      color: #f0f0f0;
-      background: #1c1c1e;
+      --bg: #1a1a1c;
+      --surface: rgba(44, 44, 48, 0.7);
+      --surface-solid: #2a2a2d;
+      --border: rgba(255, 255, 255, 0.08);
+      --text: #f1f1f3;
+      --text-soft: #a0a0a6;
+      --text-faint: #6c6c72;
+      --accent: #7b91ff;
+      --accent-soft: rgba(123, 145, 255, 0.14);
+      --record: #ff5c5c;
+      --record-soft: rgba(255, 92, 92, 0.18);
+      --danger: #ff6b6b;
     }
-    .record-panel,
-    .transcript-text,
-    select,
-    .secondary {
-      background: #2b2b2e;
-      border-color: #3a3a3d;
-      color: #f0f0f0;
+    .model-pill select {
+      background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 12'><path d='M3 5l3 3 3-3' stroke='%23a0a0a6' stroke-width='1.5' fill='none' stroke-linecap='round' stroke-linejoin='round'/></svg>");
     }
-    .vu-meter {
-      background: #1a1a1c;
-    }
-    .meta,
-    .model-picker label,
-    .hint {
-      color: #bbb;
-    }
-    .hint code {
-      background: rgba(255, 255, 255, 0.08);
-    }
-    .secondary:hover:not(:disabled) {
-      background: #333336;
+    .record {
+      box-shadow: 0 1px 2px rgba(0, 0, 0, 0.2), 0 8px 24px rgba(0, 0, 0, 0.35);
     }
   }
 </style>
