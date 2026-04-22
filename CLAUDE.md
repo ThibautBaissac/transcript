@@ -14,7 +14,8 @@ cargo run -p transcript-cli --release -- jfk.wav --model base.en
 # Install the CLI to ~/.cargo/bin (this is what the /transcribe and /speak slash commands invoke)
 cargo install --path crates/transcript-cli --locked
 
-# Rust tests — core is where almost all testable logic lives
+# Rust tests — unit tests live inline (`#[cfg(test)]`) in each module across all crates
+cargo test --workspace
 cargo test -p transcript-core
 cargo test -p transcript-core -- resample::tests::resample_48k_to_16k_rough_length   # single test
 

@@ -110,6 +110,16 @@ macOS will ask for **Microphone** permission the first time you hit Record. Appr
 
 The app downloads the selected model on first use (shown as a progress bar) and caches it in the same directory as the CLI.
 
+### Saved transcripts
+
+Recordings you transcribe in the app are saved as JSON (one file per transcript) to:
+
+```
+~/Library/Application Support/com.thibautbaissac.transcript/transcripts/
+```
+
+The sidebar lists them newest-first with a short preview; click to reopen, or use the row's delete button to remove one. The CLI does not touch this directory.
+
 ## Claude Code slash commands
 
 Two user-global slash commands wrap the CLI (installed at `~/.claude/commands/`):
@@ -137,7 +147,7 @@ No configuration needed — as long as `~/.cargo/bin/transcript` exists (after `
 ## Testing
 
 ```bash
-cargo test -p transcript-core     # unit + integration tests for the core
+cargo test --workspace            # unit tests across core, CLI, and Tauri backend
 pnpm check                        # svelte-check + TypeScript
 ```
 
