@@ -10,6 +10,7 @@
     events,
     type ModelEntry,
     type ModelId,
+    type TranscribeSegment,
     type TranscriptRecord,
     type TranscriptResult,
     type TranscriptSource,
@@ -19,7 +20,7 @@
   type Status =
     | { kind: "idle" }
     | { kind: "recording"; startedAt: number }
-    | { kind: "transcribing" }
+    | { kind: "transcribing"; pct: number }
     | { kind: "downloading"; model: string; pct: number; stage: string }
     | { kind: "error"; message: string };
 
@@ -48,6 +49,7 @@
   let currentId = $state<string | null>(null);
   let query = $state<string>("");
   let searchInput: HTMLInputElement | null = $state(null);
+  let liveSegments = $state<TranscribeSegment[]>([]);
 
   const selectedEntry = $derived(
     models.find((m) => m.id === selectedModel) ?? null,
@@ -116,6 +118,14 @@
       const pct = p.total ? Math.round((p.downloaded / p.total) * 100) : 0;
       status = { kind: "downloading", model: p.model, pct, stage: p.stage };
     });
+    const tp = events.onTranscribeProgress((p) => {
+      if (status.kind === "transcribing") {
+        status = { kind: "transcribing", pct: p.pct };
+      }
+    });
+    const tseg = events.onTranscribeSegment((s) => {
+      liveSegments = [...liveSegments, s];
+    });
     // Tauri-level drag-drop: gives us real filesystem paths (HTML5 DnD in a webview
     // only exposes file names). We listen on the webview, not the DOM.
     const drop = getCurrentWebview().onDragDropEvent((event) => {
@@ -135,7 +145,7 @@
         transcribeDroppedFile(first);
       }
     });
-    pendingListeners = [lvl, dl, drop];
+    pendingListeners = [lvl, dl, tp, tseg, drop];
   });
 
   onDestroy(async () => {
@@ -159,10 +169,12 @@
     call: () => Promise<TranscriptResult>,
     source: TranscriptSource,
   ) {
-    status = { kind: "transcribing" };
+    liveSegments = [];
+    status = { kind: "transcribing", pct: 0 };
     try {
       const result = await call();
       transcript = result;
+      liveSegments = [];
       if (autoCopy) void copyToClipboard(formatSegments(result));
       const duration = result.segments.at(-1)?.end ?? null;
       const saved = await api.saveTranscript(selectedModel, source, duration, result);
@@ -401,8 +413,10 @@
   const statusLabel = $derived.by(() => {
     switch (status.kind) {
       case "recording": return fmtDuration(elapsed);
-      case "transcribing":
-        return droppedFile ? `Transcribing ${basename(droppedFile)}…` : "Transcribing…";
+      case "transcribing": {
+        const base = droppedFile ? `Transcribing ${basename(droppedFile)}…` : "Transcribing…";
+        return status.pct > 0 ? `${base} · ${status.pct}%` : base;
+      }
       case "downloading":
         return `Downloading ${status.stage} · ${status.pct}%`;
       case "error": return status.message;
@@ -489,10 +503,16 @@
 
   <section
     class="reader"
-    class:empty={!transcript && history.length === 0}
-    class:list={!transcript && history.length > 0}
+    class:empty={!transcript && status.kind !== "transcribing" && history.length === 0}
+    class:list={!transcript && status.kind !== "transcribing" && history.length > 0}
   >
-    {#if transcript}
+    {#if status.kind === "transcribing" && liveSegments.length > 0}
+      <div class="segments live">
+        {#each liveSegments as seg (seg.index)}
+          <span class="segment live">{seg.text}</span>
+        {/each}
+      </div>
+    {:else if transcript}
       <div class="reader-actions">
         {#if history.length > 0}
           <button class="icon-btn" onclick={closeTranscript} title="Back to history">
@@ -865,6 +885,14 @@
   .segment.active {
     background: var(--accent);
     color: #fff;
+  }
+  .segment.live {
+    cursor: default;
+    opacity: 0.85;
+  }
+  .segment.live:hover { background: transparent; color: inherit; }
+  .segments.live {
+    margin-top: 18px;
   }
 
   .placeholder {

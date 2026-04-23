@@ -22,6 +22,15 @@ export type DownloadProgress = {
   total: number | null;
 };
 
+export type TranscribeProgress = { model: ModelId; pct: number };
+
+export type TranscribeSegment = {
+  index: number;
+  start: number;
+  end: number;
+  text: string;
+};
+
 export type RecordingLevel = { rms: number };
 
 export type RecordingInfo = {
@@ -94,4 +103,8 @@ export const events = {
   onLevel: (cb: (level: RecordingLevel) => void) => on<RecordingLevel>("recording-level", cb),
   onDownloadProgress: (cb: (progress: DownloadProgress) => void) =>
     on<DownloadProgress>("download-progress", cb),
+  onTranscribeProgress: (cb: (progress: TranscribeProgress) => void) =>
+    on<TranscribeProgress>("transcribe-progress", cb),
+  onTranscribeSegment: (cb: (segment: TranscribeSegment) => void) =>
+    on<TranscribeSegment>("transcribe-segment", cb),
 };

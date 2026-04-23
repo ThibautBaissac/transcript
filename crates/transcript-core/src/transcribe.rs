@@ -2,11 +2,25 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+pub use whisper_rs::SegmentCallbackData;
 use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters};
 
 use crate::audio::{DecodedAudio, decode_file};
 use crate::models::{ModelId, ModelInfo, model_info};
 use crate::resample::to_whisper_input;
+
+/// Optional hooks fired during inference. Consumers pass boxed closures so the
+/// call site can capture environment (e.g. a Tauri `AppHandle`) without forcing
+/// generics on `Engine`'s public API. The `'static` bound is required by
+/// `whisper-rs`'s safe callback setters.
+#[derive(Default)]
+pub struct TranscribeCallbacks {
+    /// Receives monotonic percent (0–100). Fires at most ~101 times per call.
+    pub on_progress: Option<Box<dyn FnMut(i32) + 'static>>,
+    /// Fires once per newly decoded segment. Timestamps are in centiseconds —
+    /// divide by 100 to get seconds (consistent with `Segment::start/end`).
+    pub on_segment: Option<Box<dyn FnMut(SegmentCallbackData) + 'static>>,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Segment {
@@ -93,6 +107,19 @@ impl Engine {
         samples_16k_mono: &[f32],
         opts: &TranscribeOptions,
     ) -> Result<TranscriptResult> {
+        self.transcribe_samples_with_callbacks(samples_16k_mono, opts, TranscribeCallbacks::default())
+    }
+
+    /// Like `transcribe_samples` but forwards whisper's progress and segment
+    /// callbacks to the caller. Use this to stream UI updates while inference
+    /// runs (the whisper call is synchronous, so callbacks fire on the calling
+    /// thread).
+    pub fn transcribe_samples_with_callbacks(
+        &self,
+        samples_16k_mono: &[f32],
+        opts: &TranscribeOptions,
+        callbacks: TranscribeCallbacks,
+    ) -> Result<TranscriptResult> {
         let mut state = self.ctx.create_state().context("creating whisper state")?;
 
         let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
@@ -113,6 +140,12 @@ impl Engine {
         params.set_language(opts.language.as_deref());
         if let Some(prompt) = opts.initial_prompt.as_deref() {
             params.set_initial_prompt(prompt);
+        }
+        if let Some(cb) = callbacks.on_progress {
+            params.set_progress_callback_safe(cb);
+        }
+        if let Some(cb) = callbacks.on_segment {
+            params.set_segment_callback_safe(cb);
         }
 
         state
@@ -167,12 +200,22 @@ impl Engine {
         path: impl AsRef<Path>,
         opts: &TranscribeOptions,
     ) -> Result<TranscriptResult> {
+        self.transcribe_file_with_callbacks(path, opts, TranscribeCallbacks::default())
+    }
+
+    /// Decode, resample, and transcribe with progress/segment callbacks.
+    pub fn transcribe_file_with_callbacks(
+        &self,
+        path: impl AsRef<Path>,
+        opts: &TranscribeOptions,
+        callbacks: TranscribeCallbacks,
+    ) -> Result<TranscriptResult> {
         let DecodedAudio {
             samples,
             sample_rate,
             channels,
         } = decode_file(path)?;
-        self.transcribe_recorded(&samples, sample_rate, channels, opts)
+        self.transcribe_recorded_with_callbacks(&samples, sample_rate, channels, opts, callbacks)
     }
 
     /// Resample a captured interleaved buffer to Whisper's required format, then transcribe.
@@ -183,8 +226,26 @@ impl Engine {
         channels: u16,
         opts: &TranscribeOptions,
     ) -> Result<TranscriptResult> {
+        self.transcribe_recorded_with_callbacks(
+            samples,
+            sample_rate,
+            channels,
+            opts,
+            TranscribeCallbacks::default(),
+        )
+    }
+
+    /// Like `transcribe_recorded` but with progress/segment callbacks.
+    pub fn transcribe_recorded_with_callbacks(
+        &self,
+        samples: &[f32],
+        sample_rate: u32,
+        channels: u16,
+        opts: &TranscribeOptions,
+        callbacks: TranscribeCallbacks,
+    ) -> Result<TranscriptResult> {
         let prepared = to_whisper_input(samples, sample_rate, channels)?;
-        self.transcribe_samples(&prepared, opts)
+        self.transcribe_samples_with_callbacks(&prepared, opts, callbacks)
     }
 }
 
@@ -378,6 +439,28 @@ mod tests {
                 .unwrap();
             assert!(!res3.segments.is_empty(), "expected segments for jfk.wav");
             assert!(!res3.text.is_empty());
+
+            // Exercise the callback path: both hooks must fire at least once.
+            use std::sync::Arc;
+            use std::sync::atomic::{AtomicUsize, Ordering};
+            let progress_hits = Arc::new(AtomicUsize::new(0));
+            let segment_hits = Arc::new(AtomicUsize::new(0));
+            let p = progress_hits.clone();
+            let s = segment_hits.clone();
+            let cbs = TranscribeCallbacks {
+                on_progress: Some(Box::new(move |_pct| {
+                    p.fetch_add(1, Ordering::Relaxed);
+                })),
+                on_segment: Some(Box::new(move |_seg| {
+                    s.fetch_add(1, Ordering::Relaxed);
+                })),
+            };
+            let res4 = engine
+                .transcribe_file_with_callbacks(&jfk, &TranscribeOptions::default(), cbs)
+                .unwrap();
+            assert!(!res4.segments.is_empty());
+            assert!(progress_hits.load(Ordering::Relaxed) > 0, "progress never fired");
+            assert!(segment_hits.load(Ordering::Relaxed) > 0, "segment never fired");
         }
     }
 

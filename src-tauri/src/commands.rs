@@ -8,8 +8,8 @@ use serde::Serialize;
 use tauri::{AppHandle, Emitter, State};
 use transcript_core::audio::{CaptureHandle, start_capture};
 use transcript_core::{
-    Engine, ModelId, ModelInfo, TranscribeOptions, TranscriptResult, format_srt, format_txt,
-    model_info, resolve_model,
+    Engine, ModelId, ModelInfo, TranscribeCallbacks, TranscribeOptions, TranscriptResult,
+    format_srt, format_txt, model_info, resolve_model,
 };
 
 use crate::transcripts::{self, TranscriptRecord, TranscriptSource, TranscriptSummary};
@@ -64,6 +64,45 @@ pub struct DownloadProgress {
     pub stage: &'static str,
     pub downloaded: u64,
     pub total: Option<u64>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+pub struct TranscribeProgress {
+    pub model: ModelId,
+    pub pct: i32,
+}
+
+#[derive(Debug, Serialize, Clone)]
+pub struct TranscribeSegment {
+    pub index: i32,
+    /// Seconds — whisper emits centiseconds, we convert before emitting.
+    pub start: f32,
+    pub end: f32,
+    pub text: String,
+}
+
+fn transcribe_callbacks(app: AppHandle, model: ModelId) -> TranscribeCallbacks {
+    let app_progress = app.clone();
+    let app_segment = app;
+    TranscribeCallbacks {
+        on_progress: Some(Box::new(move |pct| {
+            let _ = app_progress.emit(
+                "transcribe-progress",
+                TranscribeProgress { model, pct },
+            );
+        })),
+        on_segment: Some(Box::new(move |seg| {
+            let _ = app_segment.emit(
+                "transcribe-segment",
+                TranscribeSegment {
+                    index: seg.segment,
+                    start: seg.start_timestamp as f32 / 100.0,
+                    end: seg.end_timestamp as f32 / 100.0,
+                    text: seg.text.trim().to_string(),
+                },
+            );
+        })),
+    }
 }
 
 #[tauri::command]
@@ -157,6 +196,7 @@ struct StoredRecording {
 #[tauri::command]
 pub async fn transcribe_current_recording(
     state: State<'_, AppState>,
+    app: AppHandle,
     model: ModelId,
     lang: Option<String>,
 ) -> Result<TranscriptResult, String> {
@@ -172,7 +212,8 @@ pub async fn transcribe_current_recording(
     let engine_slot = state.engine.clone();
     run_blocking(move || {
         let engine = ensure_engine(&engine_slot, model)?;
-        engine.transcribe_recorded(&samples, sample_rate, channels, &opts(lang))
+        let cbs = transcribe_callbacks(app, model);
+        engine.transcribe_recorded_with_callbacks(&samples, sample_rate, channels, &opts(lang), cbs)
     })
     .await
 }
@@ -180,6 +221,7 @@ pub async fn transcribe_current_recording(
 #[tauri::command]
 pub async fn transcribe_file(
     state: State<'_, AppState>,
+    app: AppHandle,
     path: String,
     model: ModelId,
     lang: Option<String>,
@@ -188,7 +230,8 @@ pub async fn transcribe_file(
     let path = PathBuf::from(path);
     run_blocking(move || {
         let engine = ensure_engine(&engine_slot, model)?;
-        engine.transcribe_file(&path, &opts(lang))
+        let cbs = transcribe_callbacks(app, model);
+        engine.transcribe_file_with_callbacks(&path, &opts(lang), cbs)
     })
     .await
 }
@@ -362,6 +405,29 @@ mod tests {
         assert!(json.contains("\"stage\":\"ggml\""));
         assert!(json.contains("\"downloaded\":42"));
         assert!(json.contains("\"total\":100"));
+    }
+
+    #[test]
+    fn transcribe_progress_serializes_with_pct_and_model() {
+        let p = TranscribeProgress { model: ModelId::BaseEn, pct: 42 };
+        let json = serde_json::to_string(&p).unwrap();
+        assert!(json.contains("\"pct\":42"));
+        assert!(json.contains("\"model\""));
+    }
+
+    #[test]
+    fn transcribe_segment_serializes_fields() {
+        let s = TranscribeSegment {
+            index: 3,
+            start: 1.25,
+            end: 3.5,
+            text: "hello".into(),
+        };
+        let json = serde_json::to_string(&s).unwrap();
+        assert!(json.contains("\"index\":3"));
+        assert!(json.contains("\"start\":1.25"));
+        assert!(json.contains("\"end\":3.5"));
+        assert!(json.contains("\"text\":\"hello\""));
     }
 
     #[test]
